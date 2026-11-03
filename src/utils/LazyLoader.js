@@ -320,9 +320,16 @@ class LazyLoader {
             if (img.classList.contains('loaded')) return;
             if (img.hasAttribute('data-lazy-loading')) return;
 
+            // Mark as lazy loading immediately to prevent duplicate triggers
+            img.setAttribute('data-lazy-loading', '');
+
+            // Decode and draw BlurHash canvas if present
             this._decodeAndDrawBlurhash(img);
 
             img.onload = () => {
+                // Ignore load events fired by the initial transparent 1x1 GIF placeholder
+                if (img.src && img.src.startsWith('data:image/gif')) return;
+
                 img.classList.add('loaded');
                 img.removeAttribute('data-lazy-loading');
 
@@ -344,11 +351,37 @@ class LazyLoader {
                 }
             };
             img.onerror = () => {
+                // Ignore error events fired while transitioning from placeholder
+                if (img.src && img.src.startsWith('data:image/gif')) return;
+
+                // When native request interception is active but encounters a network glitch,
+                // seamlessly fallback to the authenticated JavaScript fetch and Blob URL pipeline.
+                const targetSrc = img.dataset.src;
+                if (!img.dataset.nativeFallbackTried && customHeaders?.hasCustomHeaders?.() && targetSrc) {
+                    img.dataset.nativeFallbackTried = 'true';
+                    customHeaders
+                        .resolveImageUrl(targetSrc, null, { bypassNative: true })
+                        .then((blobUrl) => {
+                            if (blobUrl && blobUrl !== targetSrc && img.isConnected) {
+                                img.removeAttribute('crossorigin');
+                                img.src = blobUrl;
+                                return;
+                            }
+                            img.removeAttribute('data-lazy-loading');
+                            this._handleImageError(img);
+                        })
+                        .catch(() => {
+                            img.removeAttribute('data-lazy-loading');
+                            this._handleImageError(img);
+                        });
+                    return;
+                }
+
                 img.removeAttribute('data-lazy-loading');
                 this._handleImageError(img);
             };
 
-            img.crossOrigin = 'anonymous';
+            // Assign image source (handles crossOrigin and custom headers resolution)
             this._assignImageSource(img, img.dataset.src);
         });
 
@@ -368,8 +401,17 @@ class LazyLoader {
      * @private
      */
     _assignImageSource(img, targetSrc) {
-        // Fast path: if no custom headers configured, assign src directly
+        // Fast path: if no custom headers configured, assign src directly with standard anonymous crossOrigin
         if (!customHeaders?.hasCustomHeaders?.()) {
+            img.crossOrigin = 'anonymous';
+            img.src = targetSrc;
+            return;
+        }
+
+        // Fast path: if native platform request interception is active (Android TV AuthenticatedWebViewClient),
+        // headers are attached at OS level. Assign URL directly without JS fetch or blob allocation.
+        if (customHeaders?.hasNativeInterception?.(targetSrc)) {
+            img.crossOrigin = 'anonymous';
             img.src = targetSrc;
             return;
         }
@@ -377,25 +419,34 @@ class LazyLoader {
         // Check if Blob URL is already in cache for zero-latency synchronous hit
         const cached = customHeaders.getCachedBlobUrl(targetSrc);
         if (cached) {
+            // Blob URLs are local memory pointers; avoid setting crossOrigin on them
+            img.removeAttribute('crossorigin');
             img.src = cached;
             return;
         }
 
-        // Mark as lazy loading so in-flight state is preserved
+        // Mark as lazy loading so in-flight state is preserved across async fetch
         img.setAttribute('data-lazy-loading', '');
 
         // Asynchronously fetch with custom headers and convert to Blob URL
         customHeaders
             .resolveImageUrl(targetSrc)
             .then((resolvedUrl) => {
-                // Ensure image element is still in DOM and pending load
-                if (img.isConnected && img.hasAttribute('data-lazy-loading')) {
+                // Ensure image element is still attached to the DOM and target URL hasn't changed
+                if (img.isConnected && img.dataset.src === targetSrc) {
+                    // Local blob URLs must not enforce CORS check in Chromium WebViews
+                    if (resolvedUrl && resolvedUrl.startsWith('blob:')) {
+                        img.removeAttribute('crossorigin');
+                    } else {
+                        img.crossOrigin = 'anonymous';
+                    }
                     img.src = resolvedUrl;
                 }
             })
             .catch(() => {
                 // Fallback to original URL so browser error handler can render initials
-                if (img.isConnected) {
+                if (img.isConnected && img.dataset.src === targetSrc) {
+                    img.crossOrigin = 'anonymous';
                     img.src = targetSrc;
                 }
             });
@@ -413,6 +464,9 @@ class LazyLoader {
         this._decodeAndDrawBlurhash(img);
 
         img.onload = () => {
+            // Ignore load events fired by the initial transparent 1x1 GIF placeholder
+            if (img.src && img.src.startsWith('data:image/gif')) return;
+
             img.classList.add('loaded');
             img.removeAttribute('data-lazy-loading');
 
@@ -434,11 +488,37 @@ class LazyLoader {
             }
         };
         img.onerror = () => {
+            // Ignore error events fired while transitioning from placeholder
+            if (img.src && img.src.startsWith('data:image/gif')) return;
+
+            // When native request interception is active but encounters a network glitch,
+            // seamlessly fallback to the authenticated JavaScript fetch and Blob URL pipeline.
+            const targetSrc = img.dataset.src;
+            if (!img.dataset.nativeFallbackTried && customHeaders?.hasCustomHeaders?.() && targetSrc) {
+                img.dataset.nativeFallbackTried = 'true';
+                customHeaders
+                    .resolveImageUrl(targetSrc, null, { bypassNative: true })
+                    .then((blobUrl) => {
+                        if (blobUrl && blobUrl !== targetSrc && img.isConnected) {
+                            img.removeAttribute('crossorigin');
+                            img.src = blobUrl;
+                            return;
+                        }
+                        img.removeAttribute('data-lazy-loading');
+                        this._handleImageError(img);
+                    })
+                    .catch(() => {
+                        img.removeAttribute('data-lazy-loading');
+                        this._handleImageError(img);
+                    });
+                return;
+            }
+
             img.removeAttribute('data-lazy-loading');
             this._handleImageError(img);
         };
 
-        img.crossOrigin = 'anonymous';
+        // Assign image source (handles crossOrigin and custom headers resolution)
         this._assignImageSource(img, img.dataset.src);
 
         if (this.observer) {

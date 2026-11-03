@@ -19,7 +19,6 @@ import { pluginManager } from '../plugins/PluginManager.js';
 import { storage } from '../utils/StorageService.js';
 import { sidebarLayoutManager } from '../utils/SidebarLayoutManager.js';
 import { sidebarIcons, getLibraryIcon } from '../utils/Icons.js';
-import { seerr } from '../api/seerrClient.js';
 import { layoutManager } from '../ui/LayoutManager.js';
 import { platformInfo } from '../utils/PlatformInfo.js';
 
@@ -58,6 +57,16 @@ class Sidebar extends Component {
     render() {
         return `
             <nav class="sidebar collapsed" id="main-sidebar">
+                <!-- Logo Section -->
+                <!-- Kept as the first flex child so the brand logo always stays anchored to the top. -->
+                <div class="sidebar-header" id="sidebar-logo-header">
+                    <div class="logo-icon">
+                        <img src="assets/icon-130.png" class="sidebar-logo-img" alt="Litefin Logo" />
+                        ${sidebarIcons.logo}
+                    </div>
+                    <span class="logo-text">Litefin</span>
+                </div>
+
                 <!-- Native Back Navigation Control (Web & Desktop) -->
                 <!-- Displayed when viewing 2nd-level routes in desktop/web environments with spring animation -->
                 <button class="sidebar-item sidebar-back-btn" id="sidebar-back-btn" tabindex="0" aria-label="${i18n.t('Back') || 'Back'}" style="display: none;">
@@ -66,15 +75,6 @@ class Sidebar extends Component {
                     </div>
                     <span class="item-text back-text" data-i18n="Back">${i18n.t('Back') || 'Back'}</span>
                 </button>
-
-                <!-- Logo Section -->
-                <div class="sidebar-header" id="sidebar-logo-header">
-                    <div class="logo-icon">
-                        <img src="assets/icon-130.png" class="sidebar-logo-img" alt="Litefin Logo" />
-                        ${sidebarIcons.logo}
-                    </div>
-                    <span class="logo-text">Litefin</span>
-                </div>
 
                 <!-- Floating Island Stationary Capsule Track -->
                 <!-- Renders the fixed background capsule for floating-island layout during scrolling -->
@@ -437,7 +437,16 @@ class Sidebar extends Component {
         // The auth:restored → _onAuthChange path ensures we re-run once ready.
         if (!auth.isAuthenticated()) return;
 
-        const isAvailable = await seerr.isAvailable();
+        // seerrClient is dynamically imported so it (and its normalize/genre
+        // helpers) stay out of the initial main bundle on TV tiers. Only the
+        // Discover-visibility probe needs it on the app shell.
+        let isAvailable = false;
+        try {
+            const { seerr } = await import('../api/seerrClient.js');
+            isAvailable = await seerr.isAvailable();
+        } catch (err) {
+            log.warn('Seerr availability probe failed', err);
+        }
 
         // Cache locally so _applySidebarLayout() can preserve this state
         // across any layout rebuild without an additional network call
@@ -1571,23 +1580,40 @@ class Sidebar extends Component {
         // Guard check: ensure root sidebar element exists
         if (!this.el) return;
 
-        // Only compute when layout is configured as floating-island
-        if (!layoutManager.isFloatingIslandSidebarLayout()) return;
-
         // Query the stationary pill capsule and scrolling content container
         const pill = this.el.querySelector('#floating-island-pill');
         const content = this.el.querySelector('.sidebar-content');
+
+        // Only compute when layout is configured as floating-island. Reset any
+        // geometry left behind by a previous floating-island session: in every
+        // other layout the pill has no absolute positioning, so a stale inline
+        // height would reserve space in the sidebar's flex column and push the
+        // navigation items and footer down towards the bottom.
+        if (!layoutManager.isFloatingIslandSidebarLayout()) {
+            if (pill) {
+                pill.style.top = '';
+                pill.style.height = '';
+            }
+            return;
+        }
+
         if (!pill || !content) return;
 
         // Compute relative bounding box of content inside the fixed sidebar container
         const update = () => {
             if (!this.el || !pill || !content) return;
 
-            // Measure relative coordinates between fixed sidebar container and content box
+            // Measure relative coordinates between fixed sidebar container and content box.
+            // getBoundingClientRect() reports viewport pixels (which include the root CSS
+            // zoom), while the values assigned to top/height are layout pixels that the
+            // browser zooms again. Divide by the root zoom so displays scaled away from
+            // the native 16:9 canvas (desktop auto-scale, Android) keep the capsule
+            // aligned instead of shrinking to zoom² of the content height.
+            const rootZoom = parseFloat(getComputedStyle(document.documentElement).zoom) || 1;
             const sidebarRect = this.el.getBoundingClientRect();
             const contentRect = content.getBoundingClientRect();
-            const top = contentRect.top - sidebarRect.top;
-            const height = contentRect.height;
+            const top = (contentRect.top - sidebarRect.top) / rootZoom;
+            const height = contentRect.height / rootZoom;
 
             // Only apply valid non-zero bounding box values
             if (height > 0) {
@@ -1965,7 +1991,7 @@ class Sidebar extends Component {
         // Determine if back navigation is valid for the current route stack
         const canBack = isPlatformAllowed && router.canGoBack();
 
-        // Toggle state class on parent container to trigger CSS spring transition pushing logo down
+        // Toggle state class on parent container to trigger the back control's entrance animation
         this.el.classList.toggle('has-back-button', canBack);
 
         // Control interactive display and accessibility tabindex on the back button

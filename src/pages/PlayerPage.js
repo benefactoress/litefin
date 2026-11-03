@@ -13,6 +13,14 @@
  * ============================================================================
  */
 
+// Page-scoped styles - loads with this module's chunk instead of the boot bundle
+import '../styles/player-page.css';
+import '../styles/player-osd.css';
+import '../styles/player-modals.css';
+import '../styles/upnext.css';
+import '../styles/syncplay-menu.css';
+import '../styles/lock-overlay.css';
+
 import Page from './Page.js';
 import { api, auth } from '../api/index.js';
 import { router } from '../core/Router.js';
@@ -46,6 +54,7 @@ import { sanitizeSubtitleText } from '../utils/Utils.js';
 import { prewarmManager } from '../player/core/PrewarmManager.js';
 import BackdropManager from '../utils/BackdropManager.js';
 import { imageService } from '../utils/ImageService.js';
+import { customHeaders } from '../utils/CustomHeaders.js';
 
 const log = logger.create('Player');
 
@@ -2130,8 +2139,26 @@ class PlayerPage extends Page {
 
         if (artEl) {
             if (artUrl) {
-                artEl.style.backgroundImage = `url('${artUrl}')`;
-                artEl.style.display = 'block';
+                // Method to update art element background cleanly
+                const applyArt = (resolvedArt) => {
+                    artEl.style.backgroundImage = `url('${resolvedArt}')`;
+                    artEl.style.display = 'block';
+                };
+
+                // Authenticate art request via CustomHeadersManager if proxy headers active
+                if (typeof customHeaders !== 'undefined' && customHeaders?.hasCustomHeaders?.()) {
+                    const cached = customHeaders.getCachedBlobUrl(artUrl);
+                    if (cached) {
+                        applyArt(cached);
+                    } else {
+                        customHeaders
+                            .resolveImageUrl(artUrl)
+                            .then(applyArt)
+                            .catch(() => applyArt(artUrl));
+                    }
+                } else {
+                    applyArt(artUrl);
+                }
             } else {
                 artEl.style.display = 'none'; // Hide if no art
             }
@@ -2230,8 +2257,26 @@ class PlayerPage extends Page {
 
         if (backdropEl) {
             if (backdropUrl) {
-                backdropEl.style.backgroundImage = `url('${backdropUrl}')`;
-                backdropEl.style.display = 'block';
+                // Method to update audio player ambient backdrop
+                const applyPlayerBackdrop = (resolvedBackdrop) => {
+                    backdropEl.style.backgroundImage = `url('${resolvedBackdrop}')`;
+                    backdropEl.style.display = 'block';
+                };
+
+                // Authenticate backdrop request via CustomHeadersManager if proxy headers active
+                if (typeof customHeaders !== 'undefined' && customHeaders?.hasCustomHeaders?.()) {
+                    const cached = customHeaders.getCachedBlobUrl(backdropUrl);
+                    if (cached) {
+                        applyPlayerBackdrop(cached);
+                    } else {
+                        customHeaders
+                            .resolveImageUrl(backdropUrl)
+                            .then(applyPlayerBackdrop)
+                            .catch(() => applyPlayerBackdrop(backdropUrl));
+                    }
+                } else {
+                    applyPlayerBackdrop(backdropUrl);
+                }
             } else {
                 backdropEl.style.display = 'none';
                 backdropEl.style.backgroundImage = '';
@@ -3235,10 +3280,16 @@ class PlayerPage extends Page {
             // is merely a standard buffer fetch in progress.
             try {
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 1500);
+                const timeoutId = setTimeout(() => controller.abort(), 2500);
                 const pingUrl = `${api.serverUrl}/System/Ping`;
+                // Attach configured custom reverse proxy headers (e.g. Cloudflare Service Tokens)
+                const pingHeaders =
+                    typeof customHeaders !== 'undefined' && customHeaders && typeof customHeaders.getHeadersForUrl === 'function'
+                        ? customHeaders.getHeadersForUrl(pingUrl, api.serverUrl)
+                        : {};
                 const response = await fetch(pingUrl, {
                     method: 'GET',
+                    headers: pingHeaders,
                     signal: controller.signal,
                     cache: 'no-store'
                 });
@@ -3411,10 +3462,16 @@ class PlayerPage extends Page {
             // Ping Jellyfin server directly
             try {
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 1800);
+                const timeoutId = setTimeout(() => controller.abort(), 2500);
                 const pingUrl = `${api.serverUrl}/System/Ping`;
+                // Attach configured custom reverse proxy headers (e.g. Cloudflare Service Tokens)
+                const pingHeaders =
+                    typeof customHeaders !== 'undefined' && customHeaders && typeof customHeaders.getHeadersForUrl === 'function'
+                        ? customHeaders.getHeadersForUrl(pingUrl, api.serverUrl)
+                        : {};
                 const response = await fetch(pingUrl, {
                     method: 'GET',
+                    headers: pingHeaders,
                     signal: controller.signal,
                     cache: 'no-store'
                 });
@@ -4390,7 +4447,8 @@ class PlayerPage extends Page {
             if (!this.el || !this.el.classList.contains('loading')) return;
 
             // Apply linear gradient over image; base loader remains solidly #000000
-            backdropLayer.style.backgroundImage = `linear-gradient(to bottom, rgba(0,0,0,0.3) 0%, rgba(0,0,0,0.8) 100%), url('${backdropUrl}')`;
+            const displayUrl = img.src || backdropUrl;
+            backdropLayer.style.backgroundImage = `linear-gradient(to bottom, rgba(0,0,0,0.3) 0%, rgba(0,0,0,0.8) 100%), url('${displayUrl}')`;
 
             // Fade in gracefully on the next animation frame
             requestAnimationFrame(() => {
@@ -4399,11 +4457,34 @@ class PlayerPage extends Page {
         };
 
         img.onerror = () => {
-            // Keep solid black on error without exposing transparency
             log.warn('Backdrop image failed to load, maintaining solid black loading background');
+
+            // Fallback: If native interception failed, attempt JS fetch & Blob URL conversion
+            if (typeof customHeaders !== 'undefined' && customHeaders?.hasCustomHeaders?.() && (img.src === backdropUrl || !img.src.startsWith('blob:'))) {
+                customHeaders
+                    .resolveImageUrl(backdropUrl, null, { bypassNative: true })
+                    .then((blobUrl) => {
+                        if (blobUrl && blobUrl !== backdropUrl) {
+                            img.src = blobUrl;
+                        }
+                    })
+                    .catch(() => {});
+            }
         };
 
-        img.src = backdropUrl;
+        // When custom reverse proxy headers are active, resolve through CustomHeadersManager
+        if (typeof customHeaders !== 'undefined' && customHeaders && customHeaders.hasCustomHeaders()) {
+            customHeaders
+                .resolveImageUrl(backdropUrl)
+                .then((resolvedUrl) => {
+                    img.src = resolvedUrl;
+                })
+                .catch(() => {
+                    img.src = backdropUrl;
+                });
+        } else {
+            img.src = backdropUrl;
+        }
         this._loadingBackdrop = backdropLayer;
     }
 
@@ -4838,30 +4919,8 @@ class PlayerPage extends Page {
      * @returns {number} Fractional value between 0.0 and 1.0
      */
     _getWatchedThresholdFraction() {
-        const mode = PlayerSettings.get('watchedThreshold') || '80';
-
-        // Respect the Jellyfin host's MaxResumePct server setting
-        if (mode === 'server') {
-            const serverMaxPct = storage.getItem('server:maxResumePct') || state.get('server:maxResumePct');
-            if (typeof serverMaxPct === 'number' && serverMaxPct > 0 && serverMaxPct <= 100) {
-                return serverMaxPct / 100;
-            }
-            const parsed = parseInt(serverMaxPct, 10);
-            if (!isNaN(parsed) && parsed > 0 && parsed <= 100) {
-                return parsed / 100;
-            }
-            // Fallback to Jellyfin's standard factory default (90%)
-            return 0.9;
-        }
-
-        // Parse explicit percentage choices (e.g. '80', '85', '90', '95', '100')
-        const pct = parseInt(mode, 10);
-        if (!isNaN(pct) && pct >= 50 && pct <= 100) {
-            return pct / 100;
-        }
-
-        // Standard Litefin fallback threshold
-        return 0.8;
+        // Delegate to centralized PlayerSettings helper so playback, home rows, and companion plugins share logic
+        return PlayerSettings.getWatchedThresholdFraction();
     }
 
     /**
@@ -5518,6 +5577,11 @@ class PlayerPage extends Page {
                     this._reportPlaybackStopped(mediaSource, positionTicks, false, durationTicks)
                 ])
             );
+
+            // Allow the server-side SQLite write pipeline a brief settling window
+            // so subsequent metadata queries upon arrival at the destination screen
+            // read committed user data rather than old pre-stop rows.
+            await new Promise((resolve) => setTimeout(resolve, 150));
         } catch (error) {
             log.warn('Error during stop:', error);
         }
@@ -5538,14 +5602,36 @@ class PlayerPage extends Page {
         // Invalidate stale caches so pages reload fresh data after playback
         if (this._item) {
             try {
-                // Update cached played/progress state across library:state:* caches without deleting state
-                // so focus restoration and grid state are preserved when returning to library pages.
-                const itemId = this._item.Id;
-                const durationTicks =
-                    this._player?.getDurationTicks?.() || mediaSource?.RunTimeTicks || this._item?.RunTimeTicks || 0;
-                const isNearComplete =
-                    this._isPlaybackEnded || (durationTicks > 0 && positionTicks >= durationTicks * 0.9);
+                // Resolve user-configured watched threshold percentage fraction
+                const thresholdFraction = this._getWatchedThresholdFraction();
 
+                // Live television streams have rolling buffer durations and must not trigger completion
+                const isLive =
+                    this._item?.Type === 'TvChannel' ||
+                    Boolean(mediaSource?.LiveStreamId || mediaSource?.IsInfiniteStream);
+
+                // Determine whether playback completed naturally or crossed the user threshold
+                const isNearComplete =
+                    !isLive &&
+                    durationTicks > 0 &&
+                    (this._isPlaybackEnded || positionTicks >= durationTicks * thresholdFraction);
+
+                const itemId = this._item.Id;
+
+                // Persist authoritative client playback stop snapshot to in-memory state.
+                // This acts as a reliable source of truth during immediate page navigation
+                // in case the server database transaction is still committing.
+                state.set('playback:lastStopped', {
+                    itemId,
+                    seriesId: this._item.SeriesId || null,
+                    seasonId: this._item.SeasonId || null,
+                    positionTicks: isNearComplete ? 0 : positionTicks,
+                    durationTicks,
+                    isNearComplete,
+                    timestamp: Date.now()
+                });
+
+                // Update cached played and progress state across all library state caches
                 const allState = state.getAll();
                 for (const [key, val] of Object.entries(allState)) {
                     if (key.startsWith('library:state:') && val?.stateData?.items) {
@@ -5561,19 +5647,42 @@ class PlayerPage extends Page {
                             }
                         }
                     }
+
+                    // Also patch any in-memory episode caches so season listings reflect new progress
+                    if (key.startsWith('details:episodes:') && Array.isArray(val)) {
+                        const match = val.find((ep) => ep?.Id === itemId);
+                        if (match) {
+                            match.UserData = match.UserData || {};
+                            if (isNearComplete) {
+                                match.UserData.Played = true;
+                                match.UserData.PlaybackPositionTicks = 0;
+                            } else if (positionTicks > 0) {
+                                match.UserData.PlaybackPositionTicks = positionTicks;
+                            }
+                        }
+                    }
                 }
             } catch (cacheErr) {
                 log.warn('Failed to patch library state cache on stop:', cacheErr);
             }
 
+            // Invalidate HTTP ETag cache to guarantee next requests do not receive 304 Not Modified
             api.clearEtagCache();
 
-            // Invalidate home page's rendered row cache
+            // Invalidate home page's rendered row cache so returning to Home loads fresh rows
             state.delete('home:pageCache');
 
-            // Invalidate episode listing for the current series/season
-            if (this._item.Type === 'Episode' && this._item.SeriesId && this._item.SeasonId) {
-                state.delete(`details:episodes:${this._item.SeriesId}:${this._item.SeasonId}`);
+            // Invalidate all details data caches (series, season, episodes, and recommendations)
+            // while preserving UI focus restore memory and remote trailer auto-chain flags
+            const allKeys = Object.keys(state.getAll());
+            for (const key of allKeys) {
+                if (
+                    key.startsWith('details:') &&
+                    !key.startsWith('details:lastFocusedItem') &&
+                    key !== 'details:autoChainRemote'
+                ) {
+                    state.delete(key);
+                }
             }
         }
 
@@ -5859,17 +5968,19 @@ class PlayerPage extends Page {
         }
 
         // Defensive safety net: if destroy is invoked directly without _stopAndExit having run
-        // (e.g. emergency external route discard), report stopped to server with synchronous XHR
+        // (e.g. emergency external route discard), report stopped to server. Asynchronously: the
+        // router only destroys pages on in-app navigation, and a synchronous XHR froze the UI
         if (!this._isExiting && this._hasReportedStart && this._item) {
             try {
                 const mediaSource = this._cachedMediaSource || this._player?.getCurrentMediaSource?.();
                 const positionTicks = this._player?.getCurrentPositionTicks?.() || this._resumePosition || 0;
                 const durationTicks =
                     this._player?.getDurationTicks?.() || mediaSource?.RunTimeTicks || this._item?.RunTimeTicks || 0;
-                this._reportPlaybackStopped(mediaSource, positionTicks, true, durationTicks);
+                this._reportPlaybackStopped(mediaSource, positionTicks, false, durationTicks);
             } catch (err) {
                 log.warn('Defensive stop report on destroy failed:', err);
             }
+            eventBus.emit('player:stopped', { itemId: this._item?.Id, reason: 'destroy' });
         }
 
         // Cancel any pending auto-recovery timers

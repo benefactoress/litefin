@@ -27,6 +27,10 @@
  * ============================================================================
  */
 
+// Page-scoped styles - loads with this module's chunk instead of the boot bundle
+import '../styles/home.css';
+import '../styles/hero-carousel.css';
+
 import Page from './Page.js';
 import { api } from '../api/index.js';
 import { VirtualCardRow } from '../components/VirtualCardRow.js';
@@ -48,6 +52,8 @@ import { homeLayoutManager } from '../utils/HomeLayoutManager.js';
 import { pluginManager } from '../plugins/PluginManager.js';
 import HeroCarousel from '../ui/HeroCarousel.js';
 import { getSeriesLastWatchedDates } from '../utils/NextUpActivity.js';
+import { fireHomeRowPrefetch, consumeHomeRowPrefetch } from '../utils/HomeRowPrefetch.js';
+import { PlayerSettings } from '../utils/PlayerSettings.js';
 
 const log = logger.create('HomePage');
 
@@ -746,6 +752,13 @@ class HomePage extends Page {
                     const daysLimit = isNaN(maxDays) ? 365 : maxDays;
                     const mergedParams = { limit: homeRowLimit };
 
+                    // Retrieve configured mark as watched threshold fraction and percentage
+                    const thresholdFraction = PlayerSettings.getWatchedThresholdFraction();
+                    const watchedThresholdPct = Math.round(thresholdFraction * 100);
+
+                    // Pass watched threshold percentage to server companion plugin query parameters
+                    mergedParams.watchedThreshold = watchedThresholdPct;
+
                     // Calculate cutoff threshold timestamp if a positive limit is enforced
                     let cutoffIso = null;
                     if (daysLimit > 0) {
@@ -761,15 +774,49 @@ class HomePage extends Page {
                     try {
                         log.info('Attempting to fetch pre-merged continue/next-up rows from Litefin plugin');
 
-                        // Request a combined list of items limited by user's homeRowLimit setting and date cutoff
-                        const response = await api.getMergedRows(mergedParams);
+                        // Consume the in-flight request fired by _fireRowPrefetch()
+                        // (parallel with Views) instead of issuing a new one.
+                        const preflight = this._consumePrefetch('merged');
+                        const response = await (preflight || api.getMergedRows(mergedParams));
 
                         // Verify that response contains valid items and no corrupted zero IDs
                         // Older or misconfigured server plugins can return Id: "0", which causes broken routes.
                         const hasCorruptIds = response?.Items?.some((i) => !i.Id || i.Id === '0');
                         if (response && response.Items && response.Items.length > 0 && !hasCorruptIds) {
-                            log.info('Successfully fetched merged items from server-side Litefin plugin');
-                            return response.Items;
+                            // Defensively filter items to ensure finished items and items exceeding watched threshold are excluded
+                            const filteredPluginItems = response.Items.filter((item) => {
+                                // Exclude invalid items and container folders
+                                if (!item || item.Type === 'Season' || item.Type === 'Series' || item.IsFolder) {
+                                    return false;
+                                }
+
+                                // Reconcile against recent authoritative playback stop state
+                                this._reconcileItemPlaybackState(item);
+
+                                // Exclude items already marked as watched/played
+                                if (item.UserData?.Played) {
+                                    return false;
+                                }
+
+                                // Exclude items that have reached or exceeded the configured watched threshold percentage
+                                const positionTicks = item.UserData?.PlaybackPositionTicks || 0;
+                                const runTimeTicks = item.RunTimeTicks || 0;
+                                if (positionTicks > 0 && runTimeTicks > 0) {
+                                    const progress = positionTicks / runTimeTicks;
+                                    if (progress >= thresholdFraction) {
+                                        return false;
+                                    }
+                                }
+
+                                return true;
+                            });
+
+                            if (filteredPluginItems.length > 0) {
+                                log.info(
+                                    'Successfully fetched and verified merged items from server-side Litefin plugin'
+                                );
+                                return filteredPluginItems;
+                            }
                         }
 
                         if (hasCorruptIds) {
@@ -805,19 +852,50 @@ class HomePage extends Page {
                     ]);
 
                     // Extract items list safely and tag them with a transient _isResume flag.
-                    // This flag enables the sorting comparator to distinguish between resume items
-                    // (which should sort by direct pause dates) and next-up items (which should
-                    // sort by show activity dates).
-                    const resumeItems = (resumeRes?.Items || []).map((item) => ({
-                        ...item,
-                        _isResume: true
-                    }));
+                    // Filter out finished items and items that have reached the configured watched threshold.
+                    const resumeItems = (resumeRes?.Items || [])
+                        .filter((item) => {
+                            // Defensive guard: Drop non-playable container folders
+                            if (!item || item.Type === 'Season' || item.Type === 'Series' || item.IsFolder) {
+                                return false;
+                            }
+
+                            // Reconcile against recent authoritative playback stop state
+                            this._reconcileItemPlaybackState(item);
+
+                            // Exclude items already marked as watched/played
+                            if (item.UserData?.Played) {
+                                return false;
+                            }
+
+                            // Exclude items that have reached or passed the configured watched threshold
+                            const positionTicks = item.UserData?.PlaybackPositionTicks || 0;
+                            const runTimeTicks = item.RunTimeTicks || 0;
+                            if (positionTicks > 0 && runTimeTicks > 0) {
+                                const progress = positionTicks / runTimeTicks;
+                                if (progress >= thresholdFraction) {
+                                    return false;
+                                }
+                            }
+
+                            return true;
+                        })
+                        .map((item) => ({
+                            ...item,
+                            _isResume: true
+                        }));
 
                     const nextUpItems = (nextUpRes?.Items || [])
                         .filter((item) => {
                             // Defensive guard: Drop non-playable container folders (e.g. Season/Series)
                             if (!item || item.Type === 'Season' || item.Type === 'Series' || item.IsFolder)
                                 return false;
+
+                            // Reconcile against recent authoritative playback stop state
+                            this._reconcileItemPlaybackState(item);
+
+                            // Drop items already watched or completed
+                            if (item.UserData?.Played) return false;
 
                             // Filter out next-up items that have already been partially played,
                             // as those are already accounted for in the continue watching row list.
@@ -927,8 +1005,36 @@ class HomePage extends Page {
                 cardType: 'resume',
                 contextType: 'resume',
                 fetchFn: async () => {
-                    const res = await api.getResumeItems({ Limit: homeRowLimit });
-                    return res?.Items?.length > 0 ? res.Items : null;
+                    // Consume the in-flight request fired by _fireRowPrefetch()
+                    // (parallel with Views) instead of issuing a new one.
+                    const preflight = this._consumePrefetch('resume');
+                    const res = await (preflight || api.getResumeItems({ Limit: homeRowLimit }));
+                    if (!res?.Items?.length) return null;
+
+                    // Defensively filter items using configured watched threshold
+                    const thresholdFraction = PlayerSettings.getWatchedThresholdFraction();
+                    const filtered = res.Items.filter((item) => {
+                        // Drop invalid items and container folders
+                        if (!item || item.IsFolder) return false;
+
+                        // Reconcile against recent authoritative playback stop state
+                        this._reconcileItemPlaybackState(item);
+
+                        // Exclude items already marked as watched/played
+                        if (item.UserData?.Played) return false;
+
+                        // Exclude items that have reached or passed the watched threshold
+                        const positionTicks = item.UserData?.PlaybackPositionTicks || 0;
+                        const runTimeTicks = item.RunTimeTicks || 0;
+                        if (positionTicks > 0 && runTimeTicks > 0) {
+                            const progress = positionTicks / runTimeTicks;
+                            if (progress >= thresholdFraction) return false;
+                        }
+
+                        return true;
+                    });
+
+                    return filtered.length > 0 ? filtered : null;
                 }
             });
 
@@ -962,12 +1068,21 @@ class HomePage extends Page {
                         params.NextUpDateCutoff = cutoff.toISOString();
                     }
 
-                    const res = await api.getNextUp(params);
+                    // Consume the in-flight request fired by _fireRowPrefetch()
+                    // (parallel with Views) instead of issuing a new one.
+                    const preflight = this._consumePrefetch('nextUp');
+                    const res = await (preflight || api.getNextUp(params));
                     if (!res?.Items?.length) return null;
 
                     const filtered = res.Items.filter((item) => {
                         // Defensive guard: Drop non-playable container folders (e.g. Season/Series)
                         if (!item || item.Type === 'Season' || item.Type === 'Series' || item.IsFolder) return false;
+
+                        // Reconcile against recent authoritative playback stop state
+                        this._reconcileItemPlaybackState(item);
+
+                        // Drop items already watched or completed
+                        if (item.UserData?.Played) return false;
 
                         const position = item.UserData?.PlaybackPositionTicks || 0;
                         return position === 0;
@@ -1071,6 +1186,33 @@ class HomePage extends Page {
     // =========================================================================
 
     /**
+     * Fire the Continue Watching / Next Up prefetch (delegates to the shared
+     * HomeRowPrefetch coordinator, which App.init also calls at the earliest
+     * boot moment so the requests overlap the HomePage chunk download and
+     * lazy style loading). Idempotent: if the requests are already in flight
+     * for this user, this is a no-op and the row fetchFns consume the
+     * in-flight promises via _consumePrefetch().
+     * @private
+     */
+    _fireRowPrefetch() {
+        fireHomeRowPrefetch(api._userId);
+    }
+
+    /**
+     * Consume an in-flight prefetch promise armed by the HomeRowPrefetch
+     * coordinator. Returns the promise (still pending or already settled)
+     * exactly once - the key is nulled after read so a later pipeline run
+     * cannot reuse a stale response. Awaiting a rejected prefetch rethrows
+     * into the row's normal error handling.
+     * @param {string} key - 'merged' | 'resume' | 'nextUp'
+     * @returns {Promise<Object>|null}
+     * @private
+     */
+    _consumePrefetch(key) {
+        return consumeHomeRowPrefetch(key, api._userId);
+    }
+
+    /**
      * Entry point for the progressive render pipeline.
      *
      * Flow:
@@ -1119,6 +1261,15 @@ class HomePage extends Page {
                     this._initHeroCarouselFromItems(cache.heroItems);
                 }
             } else {
+                // ─── Step 0.5: Fire resume/next-up prefetch in parallel ──────
+                // The Views request below gates descriptor construction and
+                // every library row, but the Continue Watching / Next Up rows
+                // do not depend on it. Fire their requests NOW so all three
+                // overlap on the wire instead of serializing behind the ~2s
+                // Views round-trip; the row fetchFns consume the in-flight
+                // promises via _consumePrefetch().
+                this._fireRowPrefetch();
+
                 // ─── Step 1: Load core dependencies ──────────────────────────────
                 // Libraries are shared across multiple descriptors.
                 // Check in-memory state cache first to avoid redundant network calls
@@ -1202,7 +1353,15 @@ class HomePage extends Page {
             // ─── Step 4: Batch pre-fetch latest library rows via plugin ──────────
             // Pre-loads all latest rows across libraries in one round-trip.
             // Executed early so network latency overlaps with initial setup.
-            await this._preFetchLatestRows(descriptors);
+            //
+            // If the homepage was restored from in-memory cache, all descriptors
+            // already have their items populated via _applyCachedRowData().
+            // Bypassing this network request during cache restoration ensures that
+            // returning to the home screen is instantaneous and never stalled by
+            // server delays, socket saturation, or network timeouts.
+            if (!cache) {
+                await this._preFetchLatestRows(descriptors);
+            }
 
             // ─── Step 5: Partition eager vs deferred rows in natural user order ─
             // The `descriptors` array is already ordered by homeLayoutManager.applyLayout()
@@ -1387,6 +1546,16 @@ class HomePage extends Page {
             const isModern = mediaLayout === 'modern';
             const isExpanded = mediaLayout === 'expanded';
             const isModernPosters = mediaLayout === 'modern-posters';
+            const isExpanding = mediaLayout === 'expanding';
+
+            // -----------------------------------------------------------------
+            // Skeleton Layout Variable Normalization
+            // -----------------------------------------------------------------
+            // Align skeleton placeholder metrics with active media row layout.
+            // Modern & Modern Posters rows share identical poster/landscape card
+            // footprints (212px poster / 396px landscape / 223px square with 26px margin).
+            // Expanding layout uses distinct expansion boundaries (175.5px poster).
+            // -----------------------------------------------------------------
             if (isExpanded) {
                 const scale = parseFloat(storage.getItem('pref:expandedCardSizeScale')) || 1.2;
                 const itemMargin = Math.round(26 * scale);
@@ -1396,8 +1565,10 @@ class HomePage extends Page {
                 sectionEl.style.setProperty('--card-expanded-width', `${Math.round(396 * scale)}px`);
                 sectionEl.style.setProperty('--card-square-width', `${Math.round(223 * scale)}px`);
                 sectionEl.style.setProperty('--card-expansion', '0px');
-            } else if (isModernPosters) {
-                const scale = parseFloat(storage.getItem('pref:modernPostersCardSizeScale')) || 1.2;
+            } else if (isModern || isModernPosters) {
+                const scale = isModernPosters
+                    ? (parseFloat(storage.getItem('pref:modernPostersCardSizeScale')) || 1.2)
+                    : (parseFloat(storage.getItem('pref:modernCardSizeScale')) || 1.2);
                 const itemMargin = Math.round(26 * scale);
                 sectionEl.style.setProperty('--card-width', `${Math.round(212 * scale)}px`);
                 sectionEl.style.setProperty('--card-height', `${Math.round(318 * scale)}px`);
@@ -1408,8 +1579,8 @@ class HomePage extends Page {
                 sectionEl.style.setProperty('--card-square-width', `${Math.round(223 * scale)}px`);
                 sectionEl.style.setProperty('--card-square-height', `${Math.round(223 * scale)}px`);
                 sectionEl.style.setProperty('--card-expansion', '0px');
-            } else if (isModern) {
-                const scale = parseFloat(storage.getItem('pref:modernCardSizeScale')) || 1.0;
+            } else if (isExpanding) {
+                const scale = parseFloat(storage.getItem('pref:expandingCardSizeScale')) || 1.0;
                 const itemMargin = Math.round(31 * scale);
                 sectionEl.style.setProperty('--card-width', `${Math.round(175.5 * scale)}px`);
                 sectionEl.style.setProperty('--card-height', `${Math.round(263.25 * scale)}px`);
@@ -3533,6 +3704,34 @@ class HomePage extends Page {
     }
 
     /**
+     * Reconciles an item's UserData against authoritative client playback state
+     * captured when the player stopped. Prevents read-after-write race conditions
+     * where the server's SQLite database has not finished committing the stop report.
+     *
+     * @param {Object} item - Media item with UserData
+     * @private
+     */
+    _reconcileItemPlaybackState(item) {
+        if (!item) return;
+
+        // Retrieve last stopped snapshot from in-memory state
+        const lastStopped = state.get('playback:lastStopped');
+        if (!lastStopped || lastStopped.itemId !== item.Id) return;
+
+        // Only reconcile if stop was recent (within 60 seconds)
+        if (Date.now() - lastStopped.timestamp > 60000) return;
+
+        item.UserData = item.UserData || {};
+        if (lastStopped.isNearComplete) {
+            item.UserData.Played = true;
+            item.UserData.PlaybackPositionTicks = 0;
+            item.UserData.UnplayedItemCount = 0;
+        } else if (lastStopped.positionTicks > 0) {
+            item.UserData.PlaybackPositionTicks = lastStopped.positionTicks;
+        }
+    }
+
+    /**
      * Saves the current homepage data to the state cache,
      * so that back-navigation renders instantly without network calls.
      * Hero carousel items are also persisted so the carousel can be
@@ -3541,6 +3740,14 @@ class HomePage extends Page {
     _savePageCache() {
         // Respect user preference
         if (storage.getItem('pref:homeScreenCache') === 'false') return;
+
+        // If playback stopped within the last few seconds, avoid storing transitional
+        // row data in the 24-hour page cache before the server fully settles.
+        const lastStopped = state.get('playback:lastStopped');
+        if (lastStopped && Date.now() - lastStopped.timestamp < 4000) {
+            log.info('Skipping _savePageCache immediately after playback stop');
+            return;
+        }
 
         const rows = {};
         for (const [id, entry] of this._rowRegistry) {

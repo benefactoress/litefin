@@ -282,3 +282,69 @@ test('CustomHeaders: authenticated image resolution, caching, and cleanup', asyn
         customHeaders.clearCache();
     }
 });
+
+test('CustomHeaders: server ping URLs (/System/Ping) receive custom proxy headers', () => {
+    const serverUrl = 'https://ma.eatingheads.com';
+    const testHeaders = [
+        { key: 'CF-Access-Client-Id', value: 'client-id-watchdog', enabled: true },
+        { key: 'CF-Access-Client-Secret', value: 'secret-key-watchdog', enabled: true }
+    ];
+
+    customHeaders.setServerHeaders(serverUrl, testHeaders);
+
+    // System ping endpoint used by playback watchdog and auto-recovery
+    const pingUrl = serverUrl + '/System/Ping';
+    const headers = customHeaders.getHeadersForUrl(pingUrl, serverUrl);
+
+    assert.strictEqual(headers['CF-Access-Client-Id'], 'client-id-watchdog');
+    assert.strictEqual(headers['CF-Access-Client-Secret'], 'secret-key-watchdog');
+});
+test('CustomHeaders: native Android request interception fast-path', async () => {
+    const serverUrl = 'https://ma.eatingheads.com';
+    const imageUrl = `${serverUrl}/Items/456/Images/Primary`;
+    const testHeaders = [
+        { key: 'CF-Access-Client-Id', value: 'client-id-test', enabled: true },
+        { key: 'CF-Access-Client-Secret', value: 'secret-key-test', enabled: true }
+    ];
+
+    customHeaders.setServerHeaders(serverUrl, testHeaders);
+    customHeaders.setActiveServer(serverUrl);
+
+    // Mock native Android bridge
+    let syncedHeaders = null;
+    global.window = {
+        LitefinAndroid: {
+            hasNativeHeaderInterception: () => true,
+            setCustomHeaders: (url, json) => {
+                syncedHeaders = JSON.parse(json);
+            }
+        }
+    };
+
+    try {
+        // Verify bridge detection
+        assert.strictEqual(customHeaders.hasNativeInterception(imageUrl, serverUrl), true);
+
+        // Verify resolveImageUrl returns original URL directly without fetch overhead
+        const resolved = await customHeaders.resolveImageUrl(imageUrl, serverUrl);
+        assert.strictEqual(resolved, imageUrl);
+
+        // Verify bypassNative: true bypasses native interception for fallback handling
+        global.fetch = async () => ({
+            ok: true,
+            status: 200,
+            blob: async () => ({ size: 1024, type: 'image/jpeg' })
+        });
+        global.URL.createObjectURL = () => 'blob:http://localhost/test-blob-uuid';
+        const bypassed = await customHeaders.resolveImageUrl(imageUrl, serverUrl, { bypassNative: true });
+        assert.strictEqual(bypassed, 'blob:http://localhost/test-blob-uuid');
+
+        // Verify header synchronization
+        customHeaders.syncCurrentServer();
+        assert.strictEqual(syncedHeaders?.['CF-Access-Client-Id'], 'client-id-test');
+        assert.strictEqual(syncedHeaders?.['CF-Access-Client-Secret'], 'secret-key-test');
+    } finally {
+        delete global.window;
+        customHeaders.clearCache();
+    }
+});

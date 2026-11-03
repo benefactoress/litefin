@@ -66,6 +66,40 @@ const DEFAULT_MODE_COLORS = {
     [THEME_MODES.CYBERPUNK]: '#ff2d78' // neon hot magenta — night-city sign
 };
 
+// ============================================================================
+// LAZY THEME STYLESHEETS
+// ============================================================================
+// The 12 static theme palettes no longer ride the boot bundle (~125KB of CSS
+// for a palette the user will never select). Only the active mode's palette
+// is fetched as an async CSS chunk the first time its mode is applied (boot
+// init or a settings switch); already-fetched palettes stay resident and the
+// CssVarsPolyfill re-resolves them on later switches via its per-tag
+// template cache.
+//
+// On legacy engines (Chromium 38-47) this is visually lossless: the full
+// derived --jf-* palette is generated per mode into
+// #litefin-dynamic-theme-vars by _applyDynamicTheme(), and the polyfill
+// resolves the newly injected theme tag against it via
+// ensureStylesResolved(). 'tinted-light' shares tinted.css - its light
+// surface deltas are generated dynamically, and unused dark.css (the only
+// theme file with :root rules) is not part of this map.
+const THEME_STYLE_IMPORTS = {
+    [THEME_MODES.CLASSIC_DARK]: () => import(/* webpackChunkName: "theme-classic-dark" */ '../themes/classic-dark.css'),
+    [THEME_MODES.CLASSIC_LIGHT]: () =>
+        import(/* webpackChunkName: "theme-classic-light" */ '../themes/classic-light.css'),
+    [THEME_MODES.BLACK]: () => import(/* webpackChunkName: "theme-black" */ '../themes/black.css'),
+    [THEME_MODES.TINTED]: () => import(/* webpackChunkName: "theme-tinted" */ '../themes/tinted.css'),
+    [THEME_MODES.TINTED_LIGHT]: () => import(/* webpackChunkName: "theme-tinted" */ '../themes/tinted.css'),
+    [THEME_MODES.AMBIENT]: () => import(/* webpackChunkName: "theme-ambient" */ '../themes/ambient.css'),
+    [THEME_MODES.EMBER]: () => import(/* webpackChunkName: "theme-ember" */ '../themes/ember.css'),
+    [THEME_MODES.SUNSET]: () => import(/* webpackChunkName: "theme-sunset" */ '../themes/sunset.css'),
+    [THEME_MODES.FROST]: () => import(/* webpackChunkName: "theme-frost" */ '../themes/frost.css'),
+    [THEME_MODES.PAPER]: () => import(/* webpackChunkName: "theme-paper" */ '../themes/paper.css'),
+    [THEME_MODES.NOCTURNE]: () => import(/* webpackChunkName: "theme-nocturne" */ '../themes/nocturne.css'),
+    [THEME_MODES.ABYSS]: () => import(/* webpackChunkName: "theme-abyss" */ '../themes/abyss.css'),
+    [THEME_MODES.CYBERPUNK]: () => import(/* webpackChunkName: "theme-cyberpunk" */ '../themes/cyberpunk.css')
+};
+
 class LayoutManager {
     constructor() {
         // Component registries per layout
@@ -104,6 +138,15 @@ class LayoutManager {
         // Black (OLED) is the default — zero compositing, pure black pixels, maximum performance.
         this._themeMode = THEME_MODES.BLACK;
 
+        // In-flight/resolved palette chunk imports, keyed by theme mode.
+        // Guarantees a single fetch per palette across repeated setThemeMode
+        // calls (boot init always runs one; settings switches run more).
+        this._themeStylePromises = {};
+
+        // In-flight/resolved modern interface layer chunk (modern/bundle.css).
+        // Single fetch across the three layout setters that may require it.
+        this._modernStylesPromise = null;
+
         // Current theme color (HEX)
         this._themeColor = DEFAULT_THEME_COLOR;
 
@@ -133,6 +176,18 @@ class LayoutManager {
 
         // Card label text scale multiplier
         this._cardLabelScale = 1.0;
+
+        /*
+         * Card Label Typography Alignment State
+         * Tracks text alignment for titles and subtitles beneath media cards ('start', 'center', 'end').
+         */
+        this._cardLabelAlign = 'start';
+
+        /*
+         * Card Label Display Presentation Style
+         * Controls label visibility and clamp limits ('default', 'titleOnly', 'titleOnly2Lines', 'hidden').
+         */
+        this._cardLabelStyle = 'default';
 
         // Low VRAM Mode: Disables GPU transitions/animations for legacy hardware
         this._lowVramMode = false;
@@ -264,15 +319,15 @@ class LayoutManager {
          * SIDEBAR LAYOUT CONFIGURATION & DEFAULT SELECTION
          * ---------------------------------------------------------------------
          * Load saved sidebar navigation layout preference from persistent storage.
-         * Ultra-legacy hardware (Chrome <47 / Tizen 2.x / c26 quirks) defaults
-         * gracefully to the lightweight 'classic' sidebar layout for maximum
-         * performance and compatibility, but users can freely select other
-         * modern or floating layout modes in Settings.
-         * Modern and legacy tiers default to 'modern-collapsed'.
+         * All hardware tiers (modern, legacy, and ultra-legacy) default
+         * to 'modern-collapsed' for a sleek, responsive, and unified navigation
+         * experience across all targets, while users remain free to choose any
+         * alternative layout mode (classic, floating buttons, etc.) in Settings.
+         *
          * ---------------------------------------------------------------------
          */
-        const isUltraLegacy = platformInfo.layoutTier === 'ultra-legacy';
-        const defaultSidebarLayout = isUltraLegacy ? 'classic' : 'modern-collapsed';
+        // Default sidebar navigation layout across all platforms and hardware tiers
+        const defaultSidebarLayout = 'modern-collapsed';
         const savedSidebarLayout = storage.getItem('pref:sidebarLayoutMode') || defaultSidebarLayout;
 
         // Load saved theme mode
@@ -401,12 +456,12 @@ class LayoutManager {
 
         // Load saved card label style and stamp it on the root HTML element
         const savedCardLabelStyle = storage.getItem('pref:cardLabelStyle') || 'default';
-        document.documentElement.setAttribute('data-card-label-style', savedCardLabelStyle);
+        this.setCardLabelStyle(savedCardLabelStyle, false);
 
         // Load saved card label alignment and stamp it on the root HTML element
         // Alignment defaults to 'start' now for cleaner card typography alignment.
         const savedCardLabelAlign = storage.getItem('pref:cardLabelAlign') || 'start';
-        document.documentElement.setAttribute('data-card-label-align', savedCardLabelAlign);
+        this.setCardLabelAlign(savedCardLabelAlign, false);
 
         // Stamp the tier and platform for CSS targeting
         document.documentElement.setAttribute('data-layout-tier', platformInfo.layoutTier);
@@ -533,6 +588,8 @@ class LayoutManager {
             document.documentElement.setAttribute('data-badge-style', resolvedStyle);
         }
         CardRenderer.clearCache();
+        // Modern row variants are styled by the lazy modern layer chunk
+        this.ensureModernStyles();
         eventBus.emit('mediaRowsLayout:changed', { layout });
     }
 
@@ -546,6 +603,8 @@ class LayoutManager {
         if (save) {
             storage.setItem('pref:loginPageLayout', layout);
         }
+        // Modern login variants are styled by the lazy modern layer chunk
+        this.ensureModernStyles();
         eventBus.emit('loginPageLayout:changed', { layout });
     }
 
@@ -760,6 +819,9 @@ class LayoutManager {
             storage.setItem('pref:sidebarLayoutMode', layout);
         }
 
+        // Modern sidebar variants are styled by the lazy modern layer chunk
+        this.ensureModernStyles();
+
         // Notify navigation components of layout modification
         eventBus.emit('sidebarLayout:changed', { layout });
     }
@@ -820,6 +882,12 @@ class LayoutManager {
 
         document.documentElement.setAttribute('data-theme-mode', mode);
 
+        // Fetch the static palette for this mode (async chunk; no-op when
+        // already fetched). The dynamic derived variables below apply
+        // immediately regardless - the palette chunk only adds the mode's
+        // static --jf-* declarations and selector-specific styling.
+        this.loadThemeStyles(mode);
+
         // Apply dynamic styles
         this._applyDynamicTheme();
 
@@ -835,6 +903,76 @@ class LayoutManager {
             log.info(`Theme mode changed to "${mode}"`);
             eventBus.emit('themeMode:changed', { mode, previousMode: oldMode });
         }
+    }
+
+    /**
+     * Ensure the static palette stylesheet for a theme mode is loaded.
+     *
+     * Kicks the async CSS chunk import for the mode's theme file exactly once
+     * (repeated calls return the same promise). When the chunk resolves, the
+     * newly injected <style> tag is adopted by the CssVarsPolyfill so its
+     * var() references resolve on legacy engines before the next repaint.
+     * No-op for modes without a palette file.
+     * @param {string} mode Theme mode constant
+     * @returns {Promise<void>|undefined}
+     */
+    loadThemeStyles(mode) {
+        const importer = THEME_STYLE_IMPORTS[mode];
+        if (!importer) return undefined;
+
+        if (!this._themeStylePromises[mode]) {
+            this._themeStylePromises[mode] = importer()
+                .then(() => {
+                    // Adopt the freshly injected palette tag (legacy engines
+                    // only; no-op when native CSS custom properties exist).
+                    cssVarsPolyfill.ensureStylesResolved();
+                    log.debug(`Theme palette loaded: "${mode}"`);
+                })
+                .catch((err) => {
+                    // Allow retry on a later setThemeMode call
+                    this._themeStylePromises[mode] = null;
+                    log.warn(`Theme palette chunk failed for "${mode}":`, err);
+                });
+        }
+
+        return this._themeStylePromises[mode];
+    }
+
+    /**
+     * Ensure the modern interface layer stylesheet is loaded.
+     *
+     * The six modern/*.css layers (~204KB source) are attribute-gated by three
+     * independent layout dimensions (sidebar family, media-rows family, login
+     * page layout). When every dimension is 'classic' the rules could never
+     * match, so the chunk is not fetched at all; otherwise it loads once as an
+     * async CSS chunk instead of riding the boot bundle. Classic->modern
+     * runtime switches trigger the fetch; the styles stay resident after.
+     * @returns {Promise<void>|undefined}
+     */
+    ensureModernStyles() {
+        const needsModern =
+            this._sidebarLayout !== 'classic' ||
+            this._mediaRowsLayout !== 'classic' ||
+            this._loginPageLayout !== 'classic';
+
+        if (!needsModern) return undefined;
+
+        if (!this._modernStylesPromise) {
+            this._modernStylesPromise = import(/* webpackChunkName: "modern-css" */ '../styles/modern/bundle.css')
+                .then(() => {
+                    // Adopt the freshly injected layer tags (legacy engines
+                    // only; no-op when native CSS custom properties exist).
+                    cssVarsPolyfill.ensureStylesResolved();
+                    log.debug('Modern interface styles loaded');
+                })
+                .catch((err) => {
+                    // Allow retry on a later layout change
+                    this._modernStylesPromise = null;
+                    log.warn('Modern styles chunk failed:', err);
+                });
+        }
+
+        return this._modernStylesPromise;
     }
 
     /**
@@ -917,6 +1055,64 @@ class LayoutManager {
             --jf-action-btn-active-border: ${focusBorderColor};
             --jf-button-border-focus: ${focusBorderColor};
             --jf-focus-border-color: ${accents.accent};`;
+
+        // 1.25. Set Semantic Button & Control Defaults per Theme Mode
+        // Ensures that CssVarsPolyfill captures the active mode's exact button and control styling.
+        const isLightMode =
+            this._themeMode === THEME_MODES.CLASSIC_LIGHT ||
+            this._themeMode === THEME_MODES.FROST ||
+            this._themeMode === THEME_MODES.PAPER ||
+            this._themeMode === THEME_MODES.TINTED_LIGHT;
+        const buttonBg = isLightMode
+            ? this._themeMode === THEME_MODES.FROST
+                ? 'rgba(27, 44, 56, 0.09)'
+                : this._themeMode === THEME_MODES.PAPER
+                  ? 'rgba(51, 42, 31, 0.07)'
+                  : '#eeeeee'
+            : this._themeMode === THEME_MODES.BLACK
+              ? '#222222'
+              : 'rgba(255, 255, 255, 0.10)';
+        const buttonHover = isLightMode
+            ? this._themeMode === THEME_MODES.FROST
+                ? 'rgba(27, 44, 56, 0.16)'
+                : this._themeMode === THEME_MODES.PAPER
+                  ? 'rgba(51, 42, 31, 0.14)'
+                  : '#e0e0e0'
+            : this._themeMode === THEME_MODES.BLACK
+              ? '#2a2a2a'
+              : 'rgba(255, 255, 255, 0.20)';
+        const inputBg = isLightMode
+            ? this._themeMode === THEME_MODES.FROST
+                ? 'rgba(27, 44, 56, 0.06)'
+                : this._themeMode === THEME_MODES.PAPER
+                  ? 'rgba(51, 42, 31, 0.05)'
+                  : '#f0f0f0'
+            : this._themeMode === THEME_MODES.BLACK
+              ? '#181818'
+              : 'rgba(255, 255, 255, 0.08)';
+        const inputBorder = isLightMode
+            ? this._themeMode === THEME_MODES.FROST
+                ? 'rgba(27, 44, 56, 0.16)'
+                : this._themeMode === THEME_MODES.PAPER
+                  ? 'rgba(51, 42, 31, 0.16)'
+                  : '#dddddd'
+            : this._themeMode === THEME_MODES.BLACK
+              ? '#222222'
+              : 'rgba(255, 255, 255, 0.15)';
+        const errorColor = isLightMode
+            ? this._themeMode === THEME_MODES.FROST
+                ? '#e25746'
+                : this._themeMode === THEME_MODES.PAPER
+                  ? '#bf5040'
+                  : '#d32f2f'
+            : '#f44336';
+
+        dynamicCss += `
+            --jf-button-bg: ${buttonBg};
+            --jf-button-hover: ${buttonHover};
+            --jf-input-bg: ${inputBg};
+            --jf-input-border: ${inputBorder};
+            --jf-error: ${errorColor};`;
 
         // 1.5. Set Text Colors (Ensures ultra-legacy build always has stable text vars)
         if (this._themeMode === THEME_MODES.TINTED_LIGHT) {
@@ -1541,6 +1737,81 @@ class LayoutManager {
 
     getCardLabelScale() {
         return this._cardLabelScale;
+    }
+
+    /**
+     * ========================================================================
+     * Card Typography Alignment Engine
+     * ========================================================================
+     * Updates card label alignment on document root and persists preference.
+     * Stamps 'data-card-label-align' onto the document root element, enabling
+     * CSS-based alignment for titles and subtitles across all media card layouts.
+     *
+     * @param {string} align - Alignment value ('start', 'center', or 'end')
+     * @param {boolean} [save=true] - Whether to persist to persistent storage
+     */
+    setCardLabelAlign(align, save = true) {
+        // Fall back to clean 'start' alignment when no valid string is supplied
+        const normalized = align || 'start';
+        this._cardLabelAlign = normalized;
+
+        // Apply attribute to document root for immediate CSS rule matching
+        document.documentElement.setAttribute('data-card-label-align', normalized);
+
+        // Persist setting to local preferences if requested
+        if (save) {
+            storage.setItem('pref:cardLabelAlign', normalized);
+        }
+
+        // Notify active grid views and observers of alignment adjustment
+        eventBus.emit('cardLabelAlign:changed', { align: normalized });
+    }
+
+    /**
+     * Retrieves currently configured card label alignment mode.
+     * @returns {string} 'start', 'center', or 'end'
+     */
+    getCardLabelAlign() {
+        return this._cardLabelAlign;
+    }
+
+    /**
+     * ========================================================================
+     * Card Label Display Style Controller
+     * ========================================================================
+     * Controls whether titles and subtitles are rendered, hidden, or clamped.
+     * Stamps 'data-card-label-style' onto the root element and purges the
+     * synchronous HTML markup cache to force fresh card generation.
+     *
+     * @param {string} style - Display mode ('default', 'titleOnly', 'titleOnly2Lines', 'hidden')
+     * @param {boolean} [save=true] - Whether to persist to persistent storage
+     */
+    setCardLabelStyle(style, save = true) {
+        // Default to standard dual-line metadata view
+        const normalized = style || 'default';
+        this._cardLabelStyle = normalized;
+
+        // Apply attribute to document root for structural stylesheet overrides
+        document.documentElement.setAttribute('data-card-label-style', normalized);
+
+        // Persist mode to local storage
+        if (save) {
+            storage.setItem('pref:cardLabelStyle', normalized);
+        }
+
+        // Clear card template cache so new card renders adapt immediately
+        CardRenderer.clearCache();
+
+        // Broadcast change event across application message bus
+        eventBus.emit('cardLabelStyle:changed', { style: normalized });
+    }
+
+    /**
+     * Retrieves currently configured card label display style.
+     * @returns {string}
+     */
+    getCardLabelStyle() {
+        return this._cardLabelStyle;
     }
 
     /**

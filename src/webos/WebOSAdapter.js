@@ -433,6 +433,11 @@ class WebOSAdapter {
      */
     _loadDeviceInfo() {
         if (!this._isWebOS) return;
+        // Guard against calling Luna services in headless unit tests or standard browsers
+        // where native PalmServiceBridge or PalmSystem objects are not present
+        if (typeof window.PalmServiceBridge === 'undefined' && typeof window.PalmSystem === 'undefined') {
+            return;
+        }
 
         try {
             if (window.webOS && typeof window.webOS.deviceInfo === 'function') {
@@ -873,6 +878,48 @@ class WebOSAdapter {
      */
     getManufacturer() {
         return this._isWebOS ? 'LG' : 'Generic';
+    }
+
+    // ========================================================================
+    // Launch Parameters
+    // ========================================================================
+
+    /**
+     * Read the params Litefin was launched with: the `params` another app passed to
+     * luna://com.webos.applicationManager/launch (e.g. { tmdbId, mediaType }).
+     * webOS hands them to the page as a JSON string in PalmSystem.launchParams.
+     *
+     * @returns {Object} Launch params (empty when launched from the home screen)
+     */
+    getLaunchParams() {
+        if (!this._isWebOS) return {};
+        try {
+            const raw = window.PalmSystem && window.PalmSystem.launchParams;
+            if (!raw) return {};
+            const params = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            return params && typeof params === 'object' ? params : {};
+        } catch (e) {
+            log.warn('Launch params could not be read:', e?.message || e);
+            return {};
+        }
+    }
+
+    /**
+     * Listen for relaunches while Litefin runs (its icon, or another app's launch call).
+     *
+     * @param {function(Object): void} callback - Receives the relaunch params ({} from the icon)
+     * @returns {function(): void} Unsubscribe
+     */
+    onRelaunch(callback) {
+        if (!this._isWebOS) return () => {};
+        const handler = (e) => {
+            /* event.detail carries the new params; PalmSystem.launchParams is updated
+             * to the same JSON, which older firmware only offers. */
+            const detail = e && e.detail;
+            callback(detail && typeof detail === 'object' ? detail : this.getLaunchParams());
+        };
+        document.addEventListener('webOSRelaunch', handler);
+        return () => document.removeEventListener('webOSRelaunch', handler);
     }
 
     get isWebOS() {

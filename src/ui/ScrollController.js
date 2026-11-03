@@ -39,7 +39,13 @@ import {
     CHASE_TAU_FACTOR,
     RAIL_DECEL_ZONE_FRACTION,
     FLING_VELOCITY_MULTIPLIER,
-    PHYSICS_SETTLE_DISTANCE_PX
+    PHYSICS_SETTLE_DISTANCE_PX,
+    GLIDE_ZONE_FRACTION,
+    GLIDE_ZONE_MAX_PX,
+    GLIDE_MIN_DURATION_MS,
+    getHorizontalDurationMs,
+    NOMINAL_FRAME_MS,
+    CADENCE_DT_MAX_MS
 } from './SpringPhysics.js';
 
 // ============================================================================
@@ -64,9 +70,6 @@ function getBaseVerticalDuration() {
     if (pref === 'smooth') return isDesktop ? 200 : 240;
     return isDesktop ? 130 : 180;
 }
-
-// Animation duration (ms) for horizontal card-centering scrolls
-const SCROLL_DURATION_HORIZONTAL = 120;
 
 // Minimum pixel difference to consider "not at target" (avoids sub-pixel jitter)
 const SCROLL_SNAP_THRESHOLD = 1;
@@ -113,6 +116,19 @@ const TALL_ROW_MULTIPLIER = 2.0;
 // gradient overlays, backdrop layer) AND the content rows (per-row translateZ(0)
 // compositor layers), causing visible frame drops. Instant-snapping large deltas
 const LARGE_SCROLL_SNAP_FRACTION = 0.45;
+
+// Distance (px) above which a vertical hop is a genuine "long leap" (hero
+// carousel ↔ content rows, multi-row jumps, page-level transitions) whose
+// duration is stretched so the compositor gets fewer, cheaper pixels per frame.
+//
+// It must sit comfortably ABOVE ordinary row-to-row hops: poster rows are
+// ~574px tall (vs ~468px for landscape/square), so their hops travel up to
+// ~600px. The old 550px line caught every single poster hop and stretched it
+// by ×1.25 — poster rows then animated ~25% slower than landscape rows at the
+// same pref:scrollSmoothingDuration, which reads as "poster rows lag when
+// scrolled to". 700px keeps every row-type hop at the configured budget while
+// still slowing true hero/multi-row leaps.
+const LARGE_JUMP_THRESHOLD_PX = 700;
 
 // ============================================================================
 // ADAPTIVE PHYSICS SAMPLING (webOS 3 / low-tier hardware)
@@ -243,13 +259,9 @@ class ScrollController {
             return stored;
         }
 
-        // On Android (both Android TV and mobile shells), default to high-performance
-        // GPU mode ('gpu') so vertical scrolling delegates to hardware compositor transforms
-        // rather than CPU main-thread scrollTop reflows.
-        if (platformInfo.isAndroid) {
-            return 'gpu';
-        }
-
+        // Default to smooth native scrolling across all platforms
+        // for unified, fluid, and predictable vertical viewport transitions.
+        // Native mode ensures consistent scroll dynamics without compositor quirks.
         return 'native';
     }
 
@@ -271,12 +283,10 @@ class ScrollController {
 
         /*
          * Default horizontal scrolling animation behavior:
-         * - On Android platforms, default to hardware-accelerated 'gpu' mode
-         *   for swift, responsive media row navigation.
-         * - On all other platforms (Smart TVs like Tizen/webOS, Desktop browsers, Tauri),
-         *   default to 'native' for smooth and continuous fluid container scrolling.
+         * - Defaults to 'native' (Smooth) across all platforms for unified,
+         *   consistent, and fluid media row scrolling.
          */
-        return platformInfo.isAndroid ? 'gpu' : 'native';
+        return 'native';
     }
 
     /**
@@ -566,6 +576,19 @@ class ScrollController {
     }
 
     /**
+     * Resolves the horizontal (media-row) scroll animation duration (ms).
+     * Honors the same 4-value scrollSmoothingDuration preference as vertical
+     * navigation ('instant' | 'current' | 'smooth' | 'slower'), mapped to
+     * proportionally quicker timings since row hops are shorter.
+     * @returns {number}
+     */
+    getHorizontalScrollDuration() {
+        const pref = storage.getItem('pref:scrollSmoothingDuration') || 'smooth';
+        const isDesktop = platformInfo.isDesktop || platformInfo.isWeb;
+        return getHorizontalDurationMs(pref, isDesktop);
+    }
+
+    /**
      * Smooth scroll with easeOutQuad easing and retarget support.
      *
      * Uses a time-based animation with proper easing curve.
@@ -600,7 +623,7 @@ class ScrollController {
                     : duration
                 : isVertical
                   ? this.getVerticalScrollDuration()
-                  : SCROLL_DURATION_HORIZONTAL;
+                  : this.getHorizontalScrollDuration();
         if (scrollMode === 'instant' || durationPref === 'instant') {
             durationToUse = 0;
         }
@@ -642,21 +665,23 @@ class ScrollController {
         // ----------------------------------------------------------------
         // DYNAMIC VELOCITY ADAPTATION (Hero Carousel & Long Leaps)
         // ----------------------------------------------------------------
-        // Standard row-to-row navigation (~350-450px) uses the snappy base duration
-        // (130ms on desktop, 180ms on TV). Only massive transitions (e.g. hero carousel ↔
-        // first content row at >550px) scale smoothly to prevent compositor hitching.
+        // Standard row-to-row navigation (up to ~600px on tall poster rows) uses the
+        // snappy base duration (130ms on desktop, 180ms on TV) so every row type feels
+        // identical. Only massive transitions (hero carousel ↔ content rows, multi-row
+        // jumps beyond LARGE_JUMP_THRESHOLD_PX) scale smoothly to prevent compositor
+        // hitching.
         // ----------------------------------------------------------------
         if (isVertical && durationToUse > 0) {
             // Measure the absolute travel distance across the vertical axis
             const distance = Math.abs(targetScroll - currentScroll);
 
-            // True large vertical transitions (e.g. hero carousel ↔ content rows at >550px)
-            if (distance > 550) {
+            // True large vertical transitions (e.g. hero carousel ↔ content rows)
+            if (distance > LARGE_JUMP_THRESHOLD_PX) {
                 const minFloor = Math.round(durationToUse * 1.25);
                 const maxCap = Math.round(durationToUse * 1.75);
                 durationToUse = Math.min(
                     maxCap,
-                    Math.max(minFloor, Math.round(durationToUse * (1 + (distance - 550) / 400)))
+                    Math.max(minFloor, Math.round(durationToUse * (1 + (distance - LARGE_JUMP_THRESHOLD_PX) / 400)))
                 );
             }
         }
@@ -981,9 +1006,16 @@ class ScrollController {
                 return;
             }
             // VELOCITY CONTINUITY: re-aim without touching current (x, v).
-            // Fresh settle budget so long re-aims aren't cut by the timeout.
+            // Fresh settle budget and glide band for long re-aims.
             existing.target = targetScroll;
             existing.startTime = null;
+            existing.elapsed = 0;
+            existing.budget = Math.max(duration || 0, SPRING_MIN_DURATION_MS);
+            existing.glide = null;
+            existing.glideZone = Math.min(
+                GLIDE_ZONE_MAX_PX,
+                Math.abs(existing.target - existing.x) * GLIDE_ZONE_FRACTION
+            );
             // Rail/fling derive their speed from remaining distance — refresh.
             if (existing.engine === 'rail') {
                 this._refreshRailState(existing, duration);
@@ -1096,12 +1128,22 @@ class ScrollController {
             if (Math.abs(existing.target - targetX) < SCROLL_SNAP_THRESHOLD) {
                 return;
             }
+            // VELOCITY CONTINUITY: re-aim without touching current (x, v).
+            // Fresh settle budget and glide band for long re-aims.
             existing.target = targetX;
             existing.startTime = null;
+            existing.elapsed = 0;
+            existing.budget = Math.max(this.getHorizontalScrollDuration(), SPRING_MIN_DURATION_MS);
+            existing.glide = null;
+            existing.glideZone = Math.min(
+                GLIDE_ZONE_MAX_PX,
+                Math.abs(existing.target - existing.x) * GLIDE_ZONE_FRACTION
+            );
+            // Rail/fling derive their speed from remaining distance — refresh.
             if (existing.engine === 'rail') {
-                this._refreshRailState(existing, SCROLL_DURATION_HORIZONTAL);
+                this._refreshRailState(existing, this.getHorizontalScrollDuration());
             } else if (existing.engine === 'fling') {
-                this._refreshFlingState(existing, SCROLL_DURATION_HORIZONTAL);
+                this._refreshFlingState(existing, this.getHorizontalScrollDuration());
             }
             return;
         }
@@ -1120,7 +1162,7 @@ class ScrollController {
             scrollMode: 'gpu',
             current: currentX,
             target: targetX,
-            duration: SCROLL_DURATION_HORIZONTAL,
+            duration: this.getHorizontalScrollDuration(),
             _write: (value) => {
                 const transformStr = transformFor(value);
                 track.style.webkitTransform = transformStr;
@@ -1160,6 +1202,9 @@ class ScrollController {
     _createPhysicsState({ engine, axis, container, track, scrollMode, current, target, duration, _write, _finalize }) {
         const distance = target - current;
         const durationFloor = Math.max(duration || 0, SPRING_MIN_DURATION_MS);
+        // Engines with exponential tails get a terminal glide band; rail
+        // already decelerates linearly, so it never needs the handover.
+        const glideZone = engine === 'rail' ? 0 : Math.min(GLIDE_ZONE_MAX_PX, Math.abs(distance) * GLIDE_ZONE_FRACTION);
         const base = {
             physics: true,
             engine,
@@ -1173,6 +1218,13 @@ class ScrollController {
             startTime: null,
             lastFrameTime: null,
             elapsed: 0,
+            // The settle budget the glide must respect. Total animation time
+            // (spring + glide) is then exactly the configured duration at any
+            // frame rate, instead of the spring's free-running exponential
+            // tail (~500ms for a 340ms setting on long hops).
+            budget: durationFloor,
+            glide: null,
+            glideZone,
             _write,
             _finalize
         };
@@ -1265,18 +1317,83 @@ class ScrollController {
                 this._recordFrameDelta(rawDelta);
             }
 
-            // Clamp frame deltas (tab stalls) but keep global elapsed real.
-            let dt = Math.min(rawDelta, 64);
+            // WALL-ACCURATE CADENCE: integrate the ACTUAL interval since the
+            // last paint (clamped). Deriving dt from a sliding median made the
+            // animation take MORE wall time than the configured duration
+            // whenever the panel got slower than the median had converged to
+            // (poster rows composite at ~30fps vs ~60fps on landscape rows →
+            // the same setting ran ~2.2x longer, the "posters feel laggy"
+            // slowdown between rows). Clamping the raw interval keeps the
+            // configured duration honest at every frame rate: 16.7ms panels
+            // paint small steps, 33ms panels paint double-sized steps at half
+            // the rate — same perceived speed — while a single late frame can
+            // never teleport (64ms tap) or stall the clock.
+            const dt = Math.min(Math.max(rawDelta, NOMINAL_FRAME_MS), CADENCE_DT_MAX_MS);
+            let remainingDt = dt;
 
-            while (dt > 0) {
-                const h = Math.min(dt, s.engine === 'spring' ? SPRING_SUBSTEP_MS : 16);
+            // Settle budget accumulates INTEGRATED simulation time, not wall
+            // clock (identical accounting to TouchHorizontalScroller). Timing
+            // the SPRING_MAX_DURATION_MS hard timeout on wall clock fired the
+            // finalize() snap while the physics was still tens of pixels
+            // short of the target — the visible post-scroll "nudge" (20-30px
+            // jump) on slow Tizen hardware. Retarget re-anchoring restarts
+            // the budget, preserving the original "fresh settle budget" intent.
+            s.elapsed += dt;
+
+            if (s.glide) {
+                // BUDGET-EXACT TERMINAL GLIDE: monotone cubic Hermite from the
+                // handover position to the target, starting at the TRUE entry
+                // velocity and landing exactly when the configured settle
+                // budget expires.
+                //
+                //   shape(u) = a·u + (3−2a)·u² + (a−2)·u³,  a = vEntry·T / R
+                //
+                // a is clamped to [0, 3] (the cubic's monotonicity limit), so
+                // the departure speed equals the spring's true velocity (C1:
+                // no mid-flight speed step — the old floor-clamped entry
+                // accelerated the paint by 30-100% at the seam) unless the
+                // spring arrived implausibly fast.
+                const u = Math.min((s.elapsed - s.glide.start) / s.glide.dur, 1);
+                const a = s.glide.alpha;
+                const shape = a * u + (3 - 2 * a) * u * u + (a - 2) * u * u * u;
+                s.x = s.glide.x0 + s.glide.span * shape;
+                // Snap bittersweet settle criterion while gliding is disabled —
+                // only the landing (u=1) or the timeout may end the state.
+                s._write(s.x);
+                if (u >= 1 || s.elapsed >= SPRING_MAX_DURATION_MS) {
+                    s._finalize(s.target);
+                    this[animIdKey] = null;
+                    this[stateKey] = null;
+                    this._checkScrollFinished();
+                    return;
+                }
+                this[animIdKey] = requestAnimationFrame(animate);
+                return;
+            }
+
+            while (remainingDt > 0) {
+                const h = Math.min(remainingDt, s.engine === 'spring' ? SPRING_SUBSTEP_MS : 16);
                 const [nx, nv] = this._advancePhysics(s, h);
                 s.x = nx;
                 s.v = nv;
-                dt -= h;
+                remainingDt -= h;
             }
-            s.elapsed = time - s.startTime;
             s._write(s.x);
+
+            // Glide handover: distance remaining inside the glide band and
+            // still moving toward the target → replace the exponential tail
+            // with a glide that consumes the REMAINING settle budget, so the
+            // total animation time equals the configured duration on every row
+            // type and frame rate.
+            const remaining = Math.abs(s.target - s.x);
+            if (remaining > 0 && remaining <= s.glideZone && !s.glide) {
+                const vEntry = Math.abs(s.v);
+                const dur = Math.max(s.budget - s.elapsed, GLIDE_MIN_DURATION_MS);
+                // a·R/T must equal the entry velocity; clamped to the cubic's
+                // monotone range.
+                const alpha = Math.min(Math.max((vEntry * dur) / remaining, 0), 3);
+                s.glide = { x0: s.x, dur, start: s.elapsed, alpha, span: s.target - s.x };
+            }
 
             const settled = this._isPhysicsSettled(s);
 
@@ -1954,7 +2071,12 @@ class ScrollController {
                             if (isInstant) {
                                 rowItems.scrollLeft = signedLeft;
                             } else {
-                                this.smoothScrollTo(rowItems, signedLeft, SCROLL_DURATION_HORIZONTAL, 'horizontal');
+                                this.smoothScrollTo(
+                                    rowItems,
+                                    signedLeft,
+                                    this.getHorizontalScrollDuration(),
+                                    'horizontal'
+                                );
                             }
                         } else if (isInstant) {
                             // =========================================================
@@ -2045,7 +2167,7 @@ class ScrollController {
                     this.smoothScrollTo(
                         rowItems,
                         finalScrollLeft,
-                        isInstant ? 0 : SCROLL_DURATION_HORIZONTAL,
+                        isInstant ? 0 : this.getHorizontalScrollDuration(),
                         'horizontal'
                     );
                 }

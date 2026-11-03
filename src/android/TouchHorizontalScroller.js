@@ -43,10 +43,13 @@ import {
     SPRING_SETTLE_DISTANCE_PX,
     SPRING_SETTLE_VELOCITY_PX_MS,
     SPRING_MAX_DURATION_MS,
+    NOMINAL_FRAME_MS,
+    CADENCE_DT_MAX_MS,
     CHASE_TAU_FACTOR,
     RAIL_DECEL_ZONE_FRACTION,
     FLING_VELOCITY_MULTIPLIER,
-    PHYSICS_SETTLE_DISTANCE_PX
+    PHYSICS_SETTLE_DISTANCE_PX,
+    getHorizontalDurationMs
 } from '../ui/SpringPhysics.js';
 
 const log = logger.create('TouchHorizontalScroller');
@@ -197,6 +200,16 @@ export class TouchHorizontalScroller {
         clearTimeout(this._scrollIdleTimer);
         this._initialized = false;
         log.info('TouchHorizontalScroller destroyed');
+    }
+
+    /**
+     * Cancels any in-flight settle animation on a specific row.
+     * Public bridge for the web/desktop MouseRowScroller so wheel input can
+     * preempt a pending settle without touching private animation state.
+     * @param {HTMLElement} rowItems - Media row container
+     */
+    cancelRowSettle(rowItems) {
+        this._cancelSettle(rowItems);
     }
 
     /**
@@ -459,7 +472,23 @@ export class TouchHorizontalScroller {
         this._cancelSettle(rowItems);
         const engine = this._getEngine();
         const distance = Math.abs(to - from);
-        const duration = Math.min(MAX_SETTLE_MS, Math.max(120, distance * 0.5));
+        // Settle budget follows the same 4-value scrollSmoothingDuration
+        // preference as everything else ('instant' | 'current' | 'smooth' |
+        // 'slower'), scaled up for larger post-fling residuals so big
+        // catch-ups still sweep instead of lurching.
+        const pref = storage.getItem('pref:scrollSmoothingDuration') || 'smooth';
+        const base = getHorizontalDurationMs(pref, platformInfo.isDesktop || platformInfo.isWeb);
+        if (base <= 0) {
+            // Instant preference: snap onto the card directly.
+            this._writeScroll(rowItems, to, isRtl);
+            if (row) {
+                row.syncScrollToPosition(to);
+                row.endTouchScroll(to);
+            }
+            eventBus.emit('scroll:finished');
+            return;
+        }
+        const duration = Math.min(MAX_SETTLE_MS, Math.max(base, Math.round(distance * 0.5)));
 
         // Shared position writer: drives the native scrollLeft AND keeps
         // VirtualCardRow's virtual window synchronized mid-animation.
@@ -523,6 +552,7 @@ export class TouchHorizontalScroller {
             v: 0,
             elapsed: 0,
             lastFrameTime: null,
+            samples: [],
             raf: 0,
             write
         };
@@ -586,8 +616,14 @@ export class TouchHorizontalScroller {
             if (state.lastFrameTime === null) {
                 state.lastFrameTime = now;
             }
-            let dt = Math.min(now - state.lastFrameTime, 64);
+            // WALL-ACCURATE CADENCE (matches ScrollController): integrate the
+            // actual interval since the last paint (clamped). The configured
+            // settle duration is then honest at any frame rate — a 30fps panel
+            // paints bigger steps at half the rate instead of stretching the
+            // sweep to twice its configured length.
+            const rawDelta = now - state.lastFrameTime;
             state.lastFrameTime = now;
+            let dt = Math.min(Math.max(rawDelta, NOMINAL_FRAME_MS), CADENCE_DT_MAX_MS);
             state.elapsed += dt;
 
             while (dt > 0) {

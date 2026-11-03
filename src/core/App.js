@@ -10,12 +10,17 @@
 import { eventBus } from './EventBus.js';
 import { state } from './StateManager.js';
 import { router } from './Router.js';
+import { playQueue } from './PlayQueue.js';
 import { api } from '../api/ApiClient.js';
+import { fireHomeRowPrefetch } from '../utils/HomeRowPrefetch.js';
 import { auth } from '../api/index.js';
 import { webSocketHandler } from '../api/WebSocketHandler.js';
 import { tizenAdapter } from '../tizen/TizenAdapter.js';
 import { webosAdapter } from '../webos/WebOSAdapter.js';
-import { androidAdapter } from '../android/AndroidAdapter.js';
+// NOTE: AndroidAdapter is NOT statically imported in the boot graph - it is
+// Android-only code (Media3 bridge, back-button key handling, MediaSession),
+// so it is loaded on demand inside the platform dispatch below. TV tiers
+// never pay its parse cost.
 import { desktopAdapter } from '../desktop/DesktopAdapter.js';
 import { webAdapter } from '../web/WebAdapter.js';
 import { platformInfo } from '../utils/PlatformInfo.js';
@@ -32,13 +37,18 @@ import { customHeadersDialog } from '../ui/CustomHeadersDialog.js';
 // Base Page class for route proxies and page lifecycle coordination
 import Page from '../pages/Page.js';
 
-// Synchronous Page imports (every remaining route resolves lazily through a
-// {@link AsyncPageProxy} below). Login and Home must boot immediately in every
-// scenario (cold boot and the post-login landing path). OfflinePage is
-// required synchronously because the browser-online probe can flip to false
-// before any async chunk would have a chance to load.
-import LoginPage from '../pages/LoginPage.js';
-import HomePage from '../pages/HomePage.js';
+// Synchronous Page import: OfflinePage only. The browser-online probe can
+// flip to false before any async chunk would have a chance to load, so the
+// offline fallback must be present from boot.
+//
+// The other two entry pages load as async chunks {@link AsyncPageProxy}:
+// HomePage's chunk import() is kicked at module evaluation time, so its
+// flash-storage read and V8 parse overlap with the async boot sequence
+// (splash -> sidebar -> auth restore -> server probe) instead of serializing
+// ahead of them, and the 19:00-style launch reaches HomePage.init() and its
+// first HTTP request without paying the home-page parse serially. LoginPage's
+// chunk is fetched strictly on demand: the dominant launch path (resumed
+// session restore) never pays for the login page at all.
 import OfflinePage from '../pages/OfflinePage.js';
 
 // ============================================================================
@@ -78,6 +88,10 @@ function loadDetailsPageModule() {
         detailsPrewarmPromise = import(/* webpackChunkName: "details" */ '../pages/DetailsPage.js')
             .then((module) => {
                 CachedDetailsClass = module.default;
+                // Chunks carry their own <style> tags (style-loader tiers);
+                // on legacy engines the CSS-var polyfill must adopt any
+                // freshly injected stylesheet synchronously before the page renders.
+                cssVarsPolyfill.ensureStylesResolved(true);
                 return CachedDetailsClass;
             })
             .catch((err) => {
@@ -106,6 +120,10 @@ function loadLibraryPageModule() {
         libraryPrewarmPromise = import(/* webpackChunkName: "library" */ '../pages/LibraryPage.js')
             .then((module) => {
                 CachedLibraryClass = module.default;
+                // Chunks carry their own <style> tags (style-loader tiers);
+                // on legacy engines the CSS-var polyfill must adopt any
+                // freshly injected stylesheet synchronously before the page renders.
+                cssVarsPolyfill.ensureStylesResolved(true);
                 return CachedLibraryClass;
             })
             .catch((err) => {
@@ -134,6 +152,10 @@ function loadPlayerModule() {
         playerPrewarmPromise = import(/* webpackChunkName: "player" */ '../pages/PlayerPage.js')
             .then((module) => {
                 CachedPlayerClass = module.default;
+                // Chunks carry their own <style> tags (style-loader tiers);
+                // on legacy engines the CSS-var polyfill must adopt any
+                // freshly injected stylesheet synchronously before the player renders.
+                cssVarsPolyfill.ensureStylesResolved(true);
                 return CachedPlayerClass;
             })
             .catch((err) => {
@@ -603,6 +625,10 @@ function createPageChunkLoader(importer) {
             chunk.promise = importer()
                 .then((module) => {
                     chunk.cached = module.default;
+                    // Chunks carry their own <style> tags (style-loader tiers);
+                    // on legacy engines the CSS-var polyfill must adopt any
+                    // freshly injected stylesheet synchronously before the page renders.
+                    cssVarsPolyfill.ensureStylesResolved(true);
                     return chunk.cached;
                 })
                 .catch((err) => {
@@ -650,6 +676,8 @@ const emulatorChunk = createPageChunkLoader(
 );
 const searchChunk = createPageChunkLoader(() => import(/* webpackChunkName: "search" */ '../pages/SearchPage.js'));
 const liveTvChunk = createPageChunkLoader(() => import(/* webpackChunkName: "livetv" */ '../pages/LiveTvPage.js'));
+const homeChunk = createPageChunkLoader(() => import(/* webpackChunkName: "home" */ '../pages/HomePage.js'));
+const loginChunk = createPageChunkLoader(() => import(/* webpackChunkName: "login" */ '../pages/LoginPage.js'));
 
 /**
  * Shared route proxy base for async page chunks. Intercepts router navigation,
@@ -792,6 +820,28 @@ class SettingsPage extends AsyncPageProxy {
 }
 
 /**
+ * Route proxy for the home view. The chunk import is kicked at module
+ * evaluation time (see {prewarmHomeChunk}) so the disk read + parse overlap
+ * with the async boot window; by the time router.navigate('/home') runs the
+ * real HomePage instance is usually created synchronously from cache.
+ */
+class HomePage extends AsyncPageProxy {
+    constructor(options) {
+        super(options, homeChunk);
+    }
+}
+
+/**
+ * Route proxy for the login view. Loaded strictly on demand so the dominant
+ * authenticated launch path never reads/parses the login module at all.
+ */
+class LoginPage extends AsyncPageProxy {
+    constructor(options) {
+        super(options, loginChunk);
+    }
+}
+
+/**
  * Route proxy for person credits / filmography views.
  */
 class PersonPage extends AsyncPageProxy {
@@ -899,11 +949,27 @@ import { versionChecker } from '../utils/VersionChecker.js';
 import { timeManager } from '../utils/TimeManager.js';
 import { globalClock } from '../ui/GlobalClock.js';
 import { smartHubManager } from '../tizen/SmartHubManager.js';
+import { launchTargetManager } from '../webos/LaunchTargetManager.js';
 import { androidLauncherManager } from '../android/AndroidLauncherManager.js';
 import { remoteButtonManager } from './RemoteButtonManager.js';
 import { screensaverManager } from './ScreensaverManager.js';
 
 const log = logger.create('App');
+
+// ============================================================================
+// HOME CHUNK EARLY KICKOFF
+// ============================================================================
+// Fire the HomePage chunk import() during boot-bundle module evaluation - the
+// earliest moment App code can run. The flash read + V8 parse of home.js then
+// overlap every async step below (splash, sidebar mount, auth restore, server
+// probe) instead of serializing ahead of them: when router.navigate('/home')
+// eventually fires, the AsyncPageProxy usually instantiates the real HomePage
+// synchronously from the already-loaded chunk. Has no effect on the login
+// path beyond one background file read; LoginPage itself stays fetch-on-demand.
+homeChunk.load().then(
+    () => log.info('HomePage chunk ready (early boot prewarm)'),
+    (err) => log.warn('HomePage chunk prewarm failed:', err)
+);
 
 class App {
     constructor() {
@@ -951,7 +1017,11 @@ class App {
         } else if (platformInfo.isWebOS) {
             webosAdapter.init();
         } else if (platformInfo.isAndroid) {
-            androidAdapter.init();
+            // Android adapter is loaded on demand here - see the module note
+            // at the top of this file.
+            import('../android/AndroidAdapter.js')
+                .then(({ androidAdapter }) => androidAdapter.init())
+                .catch((err) => log.warn('AndroidAdapter init failed:', err));
         } else if (platformInfo.isDesktop) {
             desktopAdapter.init();
         } else {
@@ -1006,6 +1076,19 @@ class App {
         //      CSS variables are already present on <html> when the polyfill scans the DOM.
         cssVarsPolyfill.init();
 
+        // 3.1.5. Parallel lazy-style prewarm.
+        // layoutManager.init() already kicked the modern interface layer and
+        // the active theme palette chunk imports (the layout setters call
+        // ensureModernStyles()/loadThemeStyles()). Re-invoking here is a
+        // cheap no-op when so, but guarantees both lazy CSS chunks are in
+        // flight from the earliest moment of App.init, fully overlapping the
+        // i18n / auth awaits and the home chunk prewarm instead of
+        // resolving one-after-another mid-boot and spending their CssVarsPolyfill
+        // adoption passes (coalesced via ensureStylesResolved) inside the
+        // /home navigation window.
+        layoutManager.ensureModernStyles();
+        layoutManager.loadThemeStyles(layoutManager.getThemeMode());
+
         // 3.5. Initialize translations + auth session in parallel
         // i18n and auth are completely independent — overlapping them saves a round-trip
         const appLanguage = storage.getItem('app_language') || 'en-us';
@@ -1026,8 +1109,42 @@ class App {
 
         document.documentElement.setAttribute('dir', isRtl ? 'rtl' : 'ltr');
 
-        // Wait for both to complete — they've been running in parallel
+        // RTL mirror rules are needed only when the resolved direction is rtl.
+        // Load the 29KB stylesheet as an async chunk right away so RTL users
+        // get identical timing to the old static import, while the (vast)
+        // LTR majority never reads or parses it at all. Both arrival orders
+        // are polyfill-safe: a tag injected before cssVarsPolyfill.init() is
+        // caught by its all-tags boot scan; after init, by the hook below.
+        if (isRtl) {
+            import(/* webpackChunkName: "rtl" */ '../styles/rtl.css')
+                .then(() => cssVarsPolyfill.ensureStylesResolved())
+                .catch((err) => log.warn('RTL stylesheet chunk failed:', err));
+        }
+
+        // Wait for both to complete - they've been running in parallel
         await Promise.all([i18nPromise, authPromise]);
+
+        // Fire the home row prefetch (Resume / NextUp) at the earliest
+        // authenticated moment - right alongside the Sidebar's GET
+        // /Users/{id}/Views instead of after HomePage's chunk + lazy styles
+        // finish loading. The HomePage render pipeline later consumes the
+        // in-flight promises via the shared HomeRowPrefetch coordinator, so
+        // the network round-trips fully overlap the ~1s of chunk/CSS loading
+        // between session restore and /home mount. Skipped when the profile
+        // picker is about to gate the session (no single active user yet).
+        if (state.get('user:authenticated')) {
+            const sessionCount = state.get('user:sessionCount', 0);
+            const activeUser = auth.getCurrentUser();
+            const activeHasPin = activeUser ? pinManager.hasPin(activeUser.Id) : false;
+            const rememberLastUser = storage.getItem('pref:rememberLastActiveUser') === 'true';
+            const initialPath = window.location.hash.slice(1) || '/';
+            const profilesGated =
+                initialPath === '/profiles' || (sessionCount > 1 && !rememberLastUser) || activeHasPin;
+
+            if (!profilesGated && activeUser) {
+                fireHomeRowPrefetch(activeUser.Id);
+            }
+        }
 
         // Load UI font if it requires server fallback font
         if (state.get('user:authenticated') && isFallbackFont(layoutManager.getUiFont())) {
@@ -1040,8 +1157,13 @@ class App {
         //      (Android TV Play Next / Channels & Mobile Launcher Shortcuts).
         //      Must run after auth.init() so the managers can read the restored auth
         //      state and start their refresh cycles immediately.
+        //      A Smart Hub tile launch is resolved before the router starts (max 3 s),
+        //      so the default route can open the tile's page instead of /home.
+        //      On webOS, a launch with { tmdbId, mediaType } params is resolved the same way.
         if (platformInfo.isTizen) {
-            smartHubManager.init();
+            await smartHubManager.init();
+        } else if (platformInfo.isWebOS) {
+            await launchTargetManager.init();
         } else if (platformInfo.isAndroid) {
             androidLauncherManager.init();
         }
@@ -1091,14 +1213,11 @@ class App {
             if (shouldDefer) {
                 log.info('Deferring plugin manager initialization: profiles screen or PIN gate is active');
             } else {
-                log.info('No profile switcher active or running on web: initializing plugin manager immediately');
-                pluginManager
-                    .init({
-                        api,
-                        focusManager,
-                        toast: null // Toast component reference wired up once UI is ready
-                    })
-                    .catch((err) => log.error('pluginManager.init failed:', err));
+                // Plugin initialization (1.2s+ of plugin network probes across
+                // several plugins) is DEFERRED until the splash screen hides -
+                // see the app:hideSplash handler below. During cold boot every
+                // HTTP/1.1 socket is needed by the entry page's data fetches.
+                this._pluginInitPending = true;
             }
         }
 
@@ -1120,14 +1239,16 @@ class App {
 
         /*
          * ============================================================================
-         * HYBRID TIME MANAGER SUBSYSTEM INITIALIZATION
+         * HYBRID TIME MANAGER SUBSYSTEM INITIALIZATION — DEFERRED
          * ============================================================================
-         * Initializes the high-precision platform clock driver (Tizen native time,
-         * WebOS Luna service, and Jellyfin LAN server time sync) before any visual
-         * clock components or playback timeline controllers render.
+         * TimeManager syncs the platform clock against the server (GET
+         * /GetUTCTime). That request would claim an HTTP/1.1 socket during the
+         * cold-boot window when the entry page needs every connection for its
+         * own data fetches, so initialization moves to the app:hideSplash
+         * handler below. The Global Clock renders afterwards and simply picks
+         * up the synced offset when it lands.
          * ============================================================================
          */
-        timeManager.init();
 
         // Initialize Global Clock — persistent time display above all UI
         globalClock.init();
@@ -1236,6 +1357,39 @@ class App {
 
             // Trigger auto-update check (respects user settings inside)
             versionChecker.checkAtStartup();
+
+            // ====================================================================
+            // DEFERRED BOOT SERVICES
+            // ====================================================================
+            // The splash screen is down and the entry page's data fetches are
+            // on the wire or done - now the connection pool has headroom for
+            // the handshakes and probes that used to contend with them:
+            //
+            // 1. Session capabilities POST + WebSocket open. On Chromium 38
+            //    (Tizen 3.0) the HTTP/1.1 pool has only 6 sockets; firing
+            //    these during the cold-boot window directly delayed first
+            //    paint (AuthManager used to send them mid-restore).
+            // 2. PluginManager init (plugin probes took ~1.2s across 4
+            //    plugins in boot traces). Gated by the same profiles/PIN
+            //    deferral decision made during init (this._pluginInitPending).
+            // 3. TimeManager server clock sync (GET /GetUTCTime).
+            if (state.get('user:authenticated')) {
+                auth.establishSessionTelemetry();
+
+                if (this._pluginInitPending) {
+                    this._pluginInitPending = false;
+                    log.info('Splash hidden — initializing plugin manager');
+                    pluginManager
+                        .init({
+                            api,
+                            focusManager,
+                            toast: null // Toast component reference wired up once UI is ready
+                        })
+                        .catch((err) => log.error('pluginManager.init failed:', err));
+                }
+
+                timeManager.init();
+            }
 
             // ====================================================================
             // Staged Background Prewarming
@@ -1395,6 +1549,17 @@ class App {
      * @private
      */
     _setupEventHandlers() {
+        // Optimistic session restore: if background token verification finds
+        // the server unreachable, route to the OfflinePage exactly like the
+        // old pre-route reachability check did. Registered here (before
+        // auth.init() resolves) so the event can never race the listener.
+        eventBus.on('auth:server-unreachable', () => {
+            if (window.location.hash.replace(/^#/, '') !== '/offline') {
+                log.info('Server unreachable after optimistic restore — routing to OfflinePage');
+                router.navigate('/offline', { replace: true });
+            }
+        });
+
         // Listen for OSD track menu bg opacity changes
         eventBus.on('pref:osdTrackMenuBgOpacity', (value) => {
             document.documentElement.style.setProperty('--osd-track-menu-bg-opacity', (value / 100).toFixed(2));
@@ -1610,7 +1775,9 @@ class App {
                 } else if (platformInfo.isWebOS) {
                     webosAdapter.exit();
                 } else if (platformInfo.isAndroid) {
-                    androidAdapter.exit();
+                    import('../android/AndroidAdapter.js')
+                        .then(({ androidAdapter }) => androidAdapter.exit())
+                        .catch((err) => log.warn('AndroidAdapter exit failed:', err));
                 } else if (platformInfo.isDesktop) {
                     desktopAdapter.exit();
                 } else {
@@ -1634,7 +1801,8 @@ class App {
                 backdropUrl,
                 fromSlideshow,
                 fromBrowse,
-                ghostMode
+                ghostMode,
+                isShufflePlay
             }) => {
                 log.info('Playback requested for item:', item?.Name, 'ID:', item?.Id);
 
@@ -1792,6 +1960,16 @@ class App {
                         return;
                     }
                 }
+
+                // ================================================================
+                // PlayQueue Shuffle Mode Synchronization
+                // ================================================================
+                // Synchronize play queue shuffle state with the incoming playback mode.
+                // An explicit shuffle play (e.g. user selected 'Shuffle' on a show or
+                // playlist) activates shuffle mode immediately for this playback session.
+                // Any standard sequential play (normal Play, Continue Watching, or Next Up)
+                // resets shuffle mode to false so subsequent episodes play in order.
+                playQueue.setShuffleMode(Boolean(isShufflePlay));
 
                 // Store playback context for play queue building (e.g. 'boxset', 'music')
                 // IMPORTANT: Always set these (even to null) to avoid context leaking from previous plays
@@ -2090,6 +2268,10 @@ class App {
                     );
                     router.navigate('/profiles', { replace: true });
                 } else if (isAuthenticated) {
+                    // Launched from a Smart Hub tile or with webOS launch params: open its page
+                    // instead (Back leads to /home)
+                    if (smartHubManager.openStartupTarget() || launchTargetManager.openStartupTarget()) return;
+
                     // Single user, no PIN, rememberLastUser active, or skipped once — skip the profiles screen and go straight home
                     log.info('Initial route: Authenticated, navigating to HomePage');
                     router.navigate('/home', { replace: true });

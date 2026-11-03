@@ -120,8 +120,86 @@ export const SPRING_SETTLE_VELOCITY_PX_MS = 0.015;
 export const PHYSICS_SETTLE_DISTANCE_PX = 0.5;
 
 /**
+ * Terminal glide band for engines with exponential tails (spring, chase,
+ * fling). Once the remaining distance enters this zone the loop hands the
+ * closing phase over to a monotone cubic Hermite that starts at the TRUE
+ * entry velocity (C1-continuous: no speed step at the seam) and lands on the
+ * target exactly when the configured settle budget expires. Without it a
+ * critically damped spring spends the last third of the animation below
+ * ~1px/frame — visually "done", then creeping for hundreds of ms (the
+ * post-scroll "hitch in two parts" on slow panels) — and the total time
+ * ignored the duration setting entirely, so slow-rendering poster rows ran
+ * visibly longer than fast landscape rows.
+ */
+export const GLIDE_ZONE_FRACTION = 0.35;
+export const GLIDE_ZONE_MAX_PX = 180;
+/** Minimum glide duration (ms) — keeps the closing phase multi-frame even
+ * when the handover happens close to the target (throttled/skipped frames)
+ * without stretching fast duration settings past their budget. */
+export const GLIDE_MIN_DURATION_MS = 60;
+
+/**
+ * Horizontal (media-row) settle duration by the 4-value
+ * 'pref:scrollSmoothingDuration' setting. Horizontal hops are short
+ * (≈ one card width), so the values run proportionally quicker than the
+ * vertical mapping for the same preference — tuned per platform for an
+ * even perceived pace with vertical navigation.
+ *
+ * @param {string} pref - 'instant' | 'current' | 'smooth' | 'slower'
+ * @param {boolean} isDesktop - Desktop / web platform flag
+ * @returns {number} Duration in ms (0 = instant snap)
+ */
+export function getHorizontalDurationMs(pref, isDesktop) {
+    if (pref === 'instant') return 0;
+    if (pref === 'current') return isDesktop ? 90 : 110;
+    if (pref === 'slower') return isDesktop ? 190 : 220;
+    return isDesktop ? 130 : 160;
+}
+
+/**
+ * Fixed integration cadence. The loop integrates the SAME dt every frame —
+ * derived from the panel's median measured frame interval (clamped between
+ * a 60fps nominal and a stability ceiling) — instead of consuming whatever
+ * late/early interval the current frame happened to have.
+ *
+ * Why: on janky TV delivery (frame intervals 16-130ms under decode load)
+ * consuming real intervals makes the per-paint step fluctuate wildly —
+ * motion speeds up on fast frames and teleports+sags on late ones, which
+ * reads as the scroll splitting into an uneven "two parts" hitch. A constant
+ * dt paints equal steps per frame; late frames simply paint earlier steps
+ * with no dent, and the animation stretches proportionally on slow panels.
+ */
+export const NOMINAL_FRAME_MS = 1000 / 60;
+export const CADENCE_DT_MAX_MS = 64;
+
+/**
+ * Fills in a stable per-frame integration step from recent raw rAF
+ * intervals: median of the valid entries, clamped to [NOMINAL_FRAME_MS,
+ * CADENCE_DT_MAX_MS]. Falls back to `fallbackMs` until 3 valid samples
+ * have accumulated.
+ *
+ * @param {number[]} samples - Raw rAF intervals, ms (zeros/undefined skipped)
+ * @param {number} fallbackMs - Step used before enough samples exist
+ * @returns {number} Integration dt for this frame
+ */
+export function stableFrameDelta(samples, fallbackMs) {
+    const valid = (samples || []).filter((d) => d > 0 && d < 4000);
+    if (valid.length < 3) {
+        return Math.min(Math.max(fallbackMs, NOMINAL_FRAME_MS), CADENCE_DT_MAX_MS);
+    }
+    valid.sort((a, b) => a - b);
+    return Math.min(Math.max(valid[Math.floor(valid.length / 2)], NOMINAL_FRAME_MS), CADENCE_DT_MAX_MS);
+}
+
+/**
  * Absolute animation timeout (ms). Safety net for pathological retarget
  * storms and tiny residual demands that technically equal the thresholds.
+ *
+ * Measured in INTEGRATED SIMULATION time (sum of clamped per-frame dt),
+ * not wall clock. Slow panels ( fps ≪ 60 ) integrate at most 64ms per rAF
+ * frame, so simulation lags real time; timing this on wall clock would
+ * fire the terminal finalize() snap while the engine was still tens of
+ * pixels from the target — the visible post-scroll "nudge" on slow TVs.
  */
 export const SPRING_MAX_DURATION_MS = 1200;
 

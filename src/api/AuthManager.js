@@ -31,7 +31,6 @@ import { state } from '../core/StateManager.js';
 import { api, ServerUnreachableError, sendWakeOnLan } from './ApiClient.js';
 import { tizenAdapter } from '../tizen/TizenAdapter.js';
 import { webosAdapter } from '../webos/WebOSAdapter.js';
-import { androidAdapter } from '../android/AndroidAdapter.js';
 import { desktopAdapter } from '../desktop/DesktopAdapter.js';
 import { webAdapter } from '../web/WebAdapter.js';
 import { platformInfo } from '../utils/PlatformInfo.js';
@@ -39,7 +38,6 @@ import { storage } from '../utils/StorageService.js';
 import { buildJellyfinProfile, clearCapabilitiesCache } from './DeviceProfile.js';
 import { focusManager } from '../ui/FocusManager.js';
 import { imageCache } from '../utils/ImageCache.js';
-import { seerr } from './seerrClient.js';
 import { customHeaders } from '../utils/CustomHeaders.js';
 import { logger } from '../utils/Logger.js';
 
@@ -135,6 +133,25 @@ class AuthManager {
         // Listen for unauthorized events from API
         eventBus.on('api:unauthorized', this._onUnauthorized);
         eventBus.on('webos:deviceInfoReady', this._onWebosDeviceInfo);
+
+        // Splash-hide coordination for deferred boot handshakes.
+        // The webOS adapter resolves device info asynchronously during boot
+        // and _onWebosDeviceInfo used to re-report session capabilities
+        // immediately - claiming an HTTP/1.1 socket in the cold-boot window
+        // when the entry page needs every connection for its data fetches.
+        // When the splash screen is still up, the report is parked and
+        // flushed by this listener (App emits app:hideSplash exactly once,
+        // after the entry page's data is on the wire).
+        this._splashHidden = false;
+        this._pendingCapsAfterSplash = false;
+        eventBus.on('app:hideSplash', () => {
+            this._splashHidden = true;
+            if (this._pendingCapsAfterSplash) {
+                this._pendingCapsAfterSplash = false;
+                log.info('Splash hidden - flushing deferred capabilities report');
+                this._reportCapabilitiesNow();
+            }
+        });
     }
 
     // ========================================================================
@@ -153,7 +170,7 @@ class AuthManager {
         log.info('Initializing...');
 
         // Ensure a unique device ID is registered with the API
-        this._ensureDeviceId();
+        await this._ensureDeviceId();
 
         // One-time migration: lift flat sessions array → per-server keyed map
         this._migrateServerSessions();
@@ -173,7 +190,7 @@ class AuthManager {
      * Ensure we have a unique device ID registered with ApiClient.
      * @private
      */
-    _ensureDeviceId() {
+    async _ensureDeviceId() {
         let deviceId = storage.getItem(STORAGE_KEYS.DEVICE_ID);
 
         if (!deviceId) {
@@ -183,13 +200,19 @@ class AuthManager {
             log.info('Generated new device ID');
         }
 
+        // NOTE: AndroidAdapter is lazily imported inside the platform dispatch
+        // below - it is Android-only code that does not belong in the boot
+        // bundle parsed by TV tiers.
+
         // Resolve device name from the corresponding platform adapter
         let deviceName;
         if (platformInfo.isWebOS) {
             // LG webOS TV device name (e.g., "LG OLED55...")
             deviceName = webosAdapter.getDeviceName();
         } else if (platformInfo.isAndroid) {
-            // Android / Fire TV device model name
+            // Android / Fire TV device model name — adapter is loaded on
+            // demand so TV tiers never parse the Android-only module.
+            const { androidAdapter } = await import('../android/AndroidAdapter.js');
             deviceName = androidAdapter.getDeviceName();
         } else if (platformInfo.isDesktop) {
             // Desktop Tauri client (e.g., "Litefin Desktop (Windows)")
@@ -291,12 +314,14 @@ class AuthManager {
         api.setAuth(session.accessToken, session.userId);
         log.info('API configured with saved credentials');
 
-        // Validate token with a server round-trip
         // =====================================================================
         // WAKE-ON-LAN (WOL) INVOCATION
         // =====================================================================
         // If Wake-on-LAN on startup is enabled and a server MAC address exists
-        // in settings, we broadcast the Magic Packet early to wake up the server.
+        // in settings, we broadcast the Magic Packet early to wake up the
+        // server, then take the BLOCKING validation path: the user explicitly
+        // asked the app to wait for a sleeping server to boot, so there is
+        // nothing useful to render optimistically.
         // =====================================================================
         const enableWol = storage.getItem('pref:enableWolOnStartup') === 'true';
         const wolMac = storage.getItem('pref:wolMacAddress');
@@ -309,25 +334,88 @@ class AuthManager {
             sendWakeOnLan(wolMac).catch((err) => {
                 log.warn('Failed to send WOL magic packet:', err);
             });
+
+            return this._blockingRestoreSession(session, sessions, activeUserId);
         }
 
         // =====================================================================
-        // TOKEN VALIDATION & RETRY LOOP
+        // OPTIMISTIC SESSION RESTORE
         // =====================================================================
-        // Attempt to validate the saved credentials against the Jellyfin server.
-        // If the server is unreachable (down/asleep) and WOL is enabled, we
-        // transparently retry the connection up to 6 times (~15 seconds) to
-        // allow the server sufficient time to wake up and bind its ports.
-        // =====================================================================
-        // Active authenticated user object resolved from validation probe
-        let user = null;
+        // With credentials armed, publish the authenticated state straight from
+        // storage and let App route to /home immediately - no GET /Users/{id},
+        // no GET /System/Info/Public round-trip serializing in front of first
+        // paint. Token validation continues in the background
+        // (_verifyRestoredSession):
+        //   • success     → the stored session is refreshed with the server's
+        //                   user record (name / image tag may have changed);
+        //   • 401 / 403   → the existing _onUnauthorized() machinery prunes the
+        //                   session and routes to /login (or /profiles);
+        //   • unreachable → App routes to /offline, matching the old
+        //                   pre-route behavior.
+        //
+        // Wake-on-LAN launches were already diverted to the blocking path
+        // above; this optimistic path is the default.
 
+        // Publish the stored identity without any server round-trip. The
+        // background verification replaces user:data with the authoritative
+        // server record once it arrives.
+        state.set('user:data', {
+            Id: session.userId,
+            Name: session.userName || '',
+            PrimaryImageTag: session.primaryImageTag || null
+        });
+        state.set('user:authenticated', true);
+        state.set('server:connected', true);
+        state.set('server:offline', false);
+        state.set('user:sessionCount', sessions.length);
+        log.info('Session restored optimistically from storage — validating token in background');
+
+        // Fire-and-forget background verification
+        this._verifyRestoredSession(session);
+
+        return true;
+    }
+
+    /**
+     * Network-unreachability predicate shared by both restore paths.
+     * @param {Error} error
+     * @returns {boolean} True when the error represents a down/asleep server
+     * rather than a definitive auth rejection.
+     * @private
+     */
+    _isUnreachableError(error) {
+        return (
+            error instanceof ServerUnreachableError ||
+            (error.status === undefined && error.message && error.message.toLowerCase().includes('fetch'))
+        );
+    }
+
+    /**
+     * Wake-on-LAN restore path: blocking token validation with the retry loop
+     * (up to ~18s, or ~90s with Extended Wait) while the server boots. On
+     * success the session is committed with the authoritative user record.
+     *
+     * Capabilities reporting and the WebSocket open are NOT done here - App
+     * calls {@link establishSessionTelemetry} once the splash screen hides so
+     * the handshake requests never contend with first-paint data fetches on
+     * Chromium 38's 6-connection HTTP/1.1 pool.
+     *
+     * @param {Object} session - Stored active session
+     * @param {Array<Object>} sessions - All stored sessions
+     * @param {string} activeUserId - Active user ID
+     * @returns {Promise<boolean>} True when the session validated
+     * @private
+     */
+    async _blockingRestoreSession(session, sessions, activeUserId) {
         // Read Extended Wait preference key to allow cold shutdown server boots (~90s total)
         const extendedWait = storage.getItem('pref:enableWolExtendedWait') === 'true';
 
-        // Define retry constraints: 25 attempts (~90s) if Extended Wait is active, else 6 attempts (~18s) if WOL is active.
-        const maxAttempts = enableWol && wolMac ? (extendedWait ? 25 : 6) : 1;
+        // WOL is guaranteed active on this path: 25 attempts (~90s) with Extended Wait, else 6 (~18s)
+        const maxAttempts = extendedWait ? 25 : 6;
         const retryDelayMs = 3000;
+
+        // Active authenticated user object resolved from validation probe
+        let user = null;
 
         try {
             for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -360,10 +448,7 @@ class AuthManager {
                 } catch (error) {
                     log.warn(`Token validation failed on attempt ${attempt}/${maxAttempts}:`, error);
 
-                    // Check if this error represents a network/routing unreachability condition.
-                    const isUnreachable =
-                        error instanceof ServerUnreachableError ||
-                        (error.status === undefined && error.message && error.message.toLowerCase().includes('fetch'));
+                    const isUnreachable = this._isUnreachableError(error);
 
                     // If this is the last allowed attempt, or the error is a definitive failure
                     // (like 401/403 Unauthorized which won't change on retry), propagate it.
@@ -392,14 +477,6 @@ class AuthManager {
             state.set('server:offline', false);
             state.set('user:sessionCount', this._loadSessions().length);
 
-            // Defer capabilities reporting and WebSocket open — non-critical for first paint
-            api.reportCapabilities({
-                ...SUPPORTED_CAPABILITIES,
-                DeviceProfile: buildJellyfinProfile()
-            }).catch((e) => log.error('✗ Failed to report capabilities on restore:', e));
-
-            api.openWebSocket();
-
             return true;
         } catch (error) {
             if (error instanceof ServerUnreachableError) {
@@ -426,6 +503,78 @@ class AuthManager {
             state.set('user:sessionCount', this._loadSessions().length);
             return false;
         }
+    }
+
+    /**
+     * Background token verification for an optimistically restored session
+     * (non-WOL path). Runs entirely off the boot critical path:
+     *   • success: refreshes the stored session + user:data with the
+     *     authoritative server record;
+     *   • 401/403: delegates to _onUnauthorized() which prunes the dead
+     *     session and emits auth:expired / auth:switchToProfiles (App then
+     *     routes to /login or /profiles);
+     *   • unreachable: flags server:offline and emits auth:server-unreachable
+     *     (App routes to the OfflinePage, matching the old pre-route check);
+     *   • other errors (5xx, parse): preserve the session, stay on home.
+     *
+     * @param {Object} session - Stored active session used for the restore
+     * @private
+     */
+    _verifyRestoredSession(session) {
+        api.getCurrentUser({ timeout: 8000 })
+            .then((user) => {
+                log.info('Background token validation succeeded:', user?.Name);
+                this._saveSession({
+                    userId: user.Id,
+                    accessToken: session.accessToken,
+                    userName: user.Name || '',
+                    primaryImageTag: user.PrimaryImageTag || null
+                });
+                state.set('user:data', user);
+                state.set('user:sessionCount', this._loadSessions().length);
+                eventBus.emit('auth:verified');
+            })
+            .catch((error) => {
+                if (error.status === 401 || error.status === 403) {
+                    log.warn('Optimistically restored session was rejected — pruning session.');
+                    this._onUnauthorized();
+                } else if (this._isUnreachableError(error)) {
+                    log.warn('Server unreachable during background session validation.');
+                    state.set('server:connected', false);
+                    state.set('server:offline', true);
+                    eventBus.emit('auth:server-unreachable');
+                } else {
+                    log.warn(
+                        `Unexpected background validation error (status ${error.status ?? '??'}) — preserving session.`,
+                        error
+                    );
+                }
+            });
+    }
+
+    /**
+     * Report session capabilities and open the real-time WebSocket for the
+     * active session.
+     *
+     * Both handshakes are deferred by App until after the initial splash
+     * screen hides: on Chromium 38 (Tizen 3.0) the HTTP/1.1 connection pool
+     * has only 6 sockets, and during cold boot every one of them is needed by
+     * the entry page's data fetches (Views / Resume / NextUp). Firing the
+     * capabilities POST and WebSocket upgrade during that window directly
+     * delays first paint.
+     *
+     * Safe to call multiple times per boot; no-ops when unauthenticated.
+     * @public
+     */
+    establishSessionTelemetry() {
+        if (!this.isAuthenticated()) return;
+
+        api.reportCapabilities({
+            ...SUPPORTED_CAPABILITIES,
+            DeviceProfile: buildJellyfinProfile()
+        }).catch((e) => log.error('✗ Failed to report capabilities on restore:', e));
+
+        api.openWebSocket();
     }
 
     // ========================================================================
@@ -863,6 +1012,24 @@ class AuthManager {
     // ========================================================================
 
     /**
+     * Clears the Seerr client response cache after a login or user switch so
+     * user-scoped requests and watchlist data are refetched. The module is
+     * dynamically imported: seerrClient is only ever needed by the Seerr
+     * feature pages and UI probes, so keeping this reference lazy lets the
+     * bundler drop it (and its normalize/genre helpers) out of the initial
+     * main bundle on TV tiers.
+     *
+     * @private
+     */
+    _clearSeerrCache() {
+        import('./seerrClient.js')
+            .then((module) => module.seerr.clearCache())
+            .catch(() => {
+                /* seerr plugin not configured for this server — nothing to clear */
+            });
+    }
+
+    /**
      * Switch the active user to another stored session without requiring
      * a password. The ApiClient credentials are swapped, capabilities are
      * re-reported, and the WebSocket is reset to the new user's token.
@@ -897,7 +1064,7 @@ class AuthManager {
         state.clearByPrefix('discover:');
 
         // Wipe Seerr client response cache so user-scoped requests and watchlist are refetched
-        seerr.clearCache();
+        this._clearSeerrCache();
 
         // Clear focus memory so old user's spatial focus targets don't persist
         focusManager.clearMemory();
@@ -999,7 +1166,7 @@ class AuthManager {
         state.clearByPrefix('discover:');
 
         // Wipe Seerr client response cache so user-scoped requests and watchlist are refetched
-        seerr.clearCache();
+        this._clearSeerrCache();
 
         // Clear focus manager memory
         focusManager.clearMemory();
@@ -1280,13 +1447,31 @@ class AuthManager {
             api.setDevice(deviceId, info.modelName);
         }
 
-        // Re-report so the server and dashboard see the real device name and profile
+        // Re-report so the server and dashboard see the real device name and profile.
+        // Deferred until after the initial splash screen hides when boot is
+        // still in the cold-start window: on Chromium 38 (Tizen 3.0 / old
+        // webOS) the HTTP/1.1 pool has only 6 sockets and the entry page's
+        // data fetches (Views / Resume / NextUp) need every one of them.
         if (this.isAuthenticated()) {
-            api.reportCapabilities({
-                ...SUPPORTED_CAPABILITIES,
-                DeviceProfile: buildJellyfinProfile()
-            }).catch((e) => log.warn('Failed to report capabilities after webOS device info:', e));
+            if (this._splashHidden) {
+                this._reportCapabilitiesNow();
+            } else {
+                this._pendingCapsAfterSplash = true;
+            }
         }
+    }
+
+    /**
+     * Report session capabilities with the current device profile.
+     * ApiClient deduplicates bursts (4s guard), so this is safe to race
+     * with the establishSessionTelemetry() call in App's splash handler.
+     * @private
+     */
+    _reportCapabilitiesNow() {
+        api.reportCapabilities({
+            ...SUPPORTED_CAPABILITIES,
+            DeviceProfile: buildJellyfinProfile()
+        }).catch((e) => log.warn('Failed to report capabilities:', e));
     }
 
     // ========================================================================

@@ -34,9 +34,13 @@ class CssVarsPolyfill {
         /**
          * Map of tracked <style> elements to their original unparsed CSS text templates.
          * Retaining raw templates allows instantaneous theme switching without re-parsing.
-         * @type {Map<HTMLStyleElement, string>}
+         *
+         * Weak keys: page-level stylesheets are injected per async chunk and removed
+         * again when their page component is destroyed, so strong references here
+         * would leak every visited page's style element for the app's lifetime.
+         * @type {WeakMap<HTMLStyleElement, string>}
          */
-        this._styleTemplates = new Map();
+        this._styleTemplates = new WeakMap();
 
         /**
          * Cached baseline variables extracted from static :root rules.
@@ -44,6 +48,28 @@ class CssVarsPolyfill {
          * @type {Object|null}
          */
         this._cachedRootVars = null;
+
+        /**
+         * Guard for coalescing concurrent ensureStylesResolved() triggers.
+         * Multiple async CSS chunks (modern layer, theme palette, rtl,
+         * page chunks) can resolve within the same macrotask; each used to
+         * run its own full <style>-tag scan pass back-to-back on the main
+         * thread. Coalescing schedules exactly one pass per tick.
+         * @type {boolean}
+         */
+        this._resolvePassScheduled = false;
+
+        /**
+         * Style tags whose :root declarations have already been folded into
+         * {@link CssVarsPolyfill#_cachedRootVars}. Chunks injected later
+         * (player, details, theme palettes...) carry their own :root blocks;
+         * without incremental adoption their variables would be invisible
+         * to the substitution map (the cache is snapshotted at cold boot,
+         * before any async chunk exists), leaving no-fallback var() usages
+         * unresolved on legacy engines.
+         * @type {WeakSet<HTMLStyleElement>}
+         */
+        this._rootScannedTags = new WeakSet();
     }
 
     /**
@@ -67,6 +93,10 @@ class CssVarsPolyfill {
         }
 
         this._active = true;
+        // Expose polyfill singleton on window for runtime diagnostics and inspectability
+        if (typeof window !== 'undefined') {
+            window.cssVarsPolyfill = this;
+        }
         log.info('CSS vars NOT natively supported — activating high-speed engine');
 
         const self = this;
@@ -88,6 +118,78 @@ class CssVarsPolyfill {
     }
 
     /**
+     * Incrementally resolve styles injected after boot.
+     *
+     * Async page/player chunks ship their own <style> tags (style-loader
+     * tiers) that carry var() references but were never seen by the initial
+     * pass. This processes ONLY uncached, unprocessed tags - already-tracked
+     * stylesheets keep their cached raw template and are left untouched, so
+     * the cost is proportional to the newly loaded chunk, not the whole DOM.
+     *
+     * AsyncPageProxy calls this after each chunk module resolves. No-op when
+     * native CSS custom properties are supported.
+     */
+    ensureStylesResolved(sync = false) {
+        if (!this._active) return;
+
+        // When synchronous resolution is requested (e.g. immediately before page mount),
+        // run the style resolution pass right away so the page renders with computed styles.
+        if (sync) {
+            this._resolvePassScheduled = false;
+            this._runStyleResolutionPass();
+            return;
+        }
+
+        // Coalesce concurrent triggers into a single resolution pass.
+        // When several lazy chunks resolve in the same tick (e.g. the modern
+        // interface layer and the theme palette finishing together during
+        // boot), running the scan once after the current macrotask settles
+        // adopts all freshly injected tags in one O(new tags) sweep instead
+        // of three back-to-back full scans blocking the main thread.
+        if (this._resolvePassScheduled) return;
+        this._resolvePassScheduled = true;
+        setTimeout(() => {
+            this._resolvePassScheduled = false;
+            this._runStyleResolutionPass();
+        }, 0);
+    }
+
+    /**
+     * One incremental resolution pass over untracked style tags.
+     * Scheduled by {@link ensureStylesResolved}; never runs concurrently
+     * with another pass.
+     * @private
+     */
+    _runStyleResolutionPass() {
+        const startTime = Date.now();
+        const themeVars = this._extractThemeVariables();
+        const styleTags = document.querySelectorAll('style:not(#litefin-dynamic-theme-vars)');
+        let updatedCount = 0;
+
+        for (let i = 0; i < styleTags.length; i++) {
+            const styleEl = styleTags[i];
+
+            // Already tracked by a previous pass - its template is resolved
+            // wholesale by _applyTransform on the next theme update instead.
+            if (this._styleTemplates.get(styleEl)) continue;
+
+            const rawCss = styleEl.textContent || '';
+            if (rawCss.indexOf('var(--') === -1) continue;
+
+            this._styleTemplates.set(styleEl, rawCss);
+            styleEl.textContent = this._resolveCssVars(rawCss, themeVars);
+            styleEl.setAttribute('data-cssvars', 'applied');
+            updatedCount++;
+        }
+
+        if (updatedCount > 0) {
+            log.debug(
+                `Lazy style resolution complete in ${Date.now() - startTime}ms (${updatedCount} style(s) updated)`
+            );
+        }
+    }
+
+    /**
      * Executes the variable resolution pass across tracked stylesheets.
      *
      * Scans for the primary singleton bundled stylesheet (#litefin-bundled-styles)
@@ -102,17 +204,25 @@ class CssVarsPolyfill {
         // 1. Extract all active theme and :root variables
         const themeVars = this._extractThemeVariables();
 
-        // 2. Discover style tags to transform
-        // Priority: target our singleton bundled style tag if present,
-        // or discover all style tags excluding dynamic helper stylesheets.
-        let targetStyles = [];
+        // 2. Discover style tags to transform.
+        // Process ALL active inline <style> elements (excluding the dynamic
+        // theme helper tag, which LayoutManager keeps var()-free and re-writes
+        // itself on every theme change). This intentionally includes both the
+        // boot singleton (#litefin-bundled-styles) and any per-chunk styles
+        // injected later by lazily loaded pages - the template cache below
+        // makes repeat passes over already-resolved tags nearly free, so
+        // scanning wide is cheaper than tracking which pages loaded when.
+        // The bundled singleton is forced to the front so its transform (and
+        // any logging derived from it) keeps its historical ordering.
         const bundledStyle = document.getElementById('litefin-bundled-styles');
-
+        const allStyles = Array.prototype.slice.call(
+            document.querySelectorAll('style:not(#litefin-dynamic-theme-vars)')
+        );
+        const targetStyles = allStyles.filter(function (el) {
+            return el !== bundledStyle;
+        });
         if (bundledStyle) {
-            targetStyles = [bundledStyle];
-        } else {
-            const allStyles = document.querySelectorAll('style:not(#litefin-dynamic-theme-vars)');
-            targetStyles = Array.prototype.slice.call(allStyles);
+            targetStyles.unshift(bundledStyle);
         }
 
         let updatedCount = 0;
@@ -409,6 +519,31 @@ class CssVarsPolyfill {
     }
 
     /**
+     * Extracts :root custom-property declarations from one style tag into the
+     * cached baseline map (shared by the cold-boot snapshot and the
+     * incremental late-tag adoption in {@link _extractThemeVariables}).
+     * @param {HTMLStyleElement} styleEl - Tag to scan
+     * @param {RegExp} rootBlockRegex - Reusable /:root[^{]*\{([^}]+)\}/g matcher
+     * @param {RegExp} varRegex - Reusable /(--[a-zA-Z0-9_-]+)\s*:\s*([^;}]+)/g matcher
+     * @private
+     */
+    _scanRootBlocks(styleEl, rootBlockRegex, varRegex) {
+        const cssText = styleEl.textContent || '';
+        if (cssText.indexOf(':root') === -1) return;
+
+        let match;
+        while ((match = rootBlockRegex.exec(cssText)) !== null) {
+            const blockContent = match[1];
+            varRegex.lastIndex = 0;
+            let varMatch;
+            while ((varMatch = varRegex.exec(blockContent)) !== null) {
+                this._cachedRootVars[varMatch[1].trim()] = varMatch[2].trim();
+            }
+        }
+        rootBlockRegex.lastIndex = 0;
+    }
+
+    /**
      * Extracts CSS variables from the currently active theme.
      * Caches baseline :root variables once to eliminate repetitive 1.4MB full-text
      * regex scans, extracting dynamic theme values from #litefin-dynamic-theme-vars
@@ -426,28 +561,39 @@ class CssVarsPolyfill {
 
         /*
          * ====================================================================
-         * 1. Baseline :root variables (Extracted & cached once on cold boot)
+         * 1. Baseline :root variables
          * ====================================================================
-         * The primary stylesheet contains static :root declarations that never
-         * mutate at runtime. Caching these once prevents scanning 1.4MB with
-         * regular expressions on subsequent theme updates.
+         * Static :root declarations can live in ANY inline <style> tag (page
+         * stylesheets load as per-chunk style tags; no boot singleton
+         * anymore). The multi-megabyte all-tags scan runs exactly once on
+         * cold boot and is cached; afterwards only newly injected tags are
+         * scanned (see the incremental block below) so chunks like the
+         * player, details page, or a lazily loaded theme palette still
+         * contribute their :root variables to the substitution map.
          */
         if (!this._cachedRootVars) {
             this._cachedRootVars = {};
             const rootBlockRegex = /:root[^{]*\{([^}]+)\}/g;
-            const bundledStyle = document.getElementById('litefin-bundled-styles');
-            const target = bundledStyle || document.querySelector('style:not(#litefin-dynamic-theme-vars)');
+            const styleTags = document.querySelectorAll('style:not(#litefin-dynamic-theme-vars)');
 
-            if (target && target.textContent) {
-                const cssText = target.textContent;
-                let match;
-                while ((match = rootBlockRegex.exec(cssText)) !== null) {
-                    const blockContent = match[1];
-                    varRegex.lastIndex = 0;
-                    let varMatch;
-                    while ((varMatch = varRegex.exec(blockContent)) !== null) {
-                        this._cachedRootVars[varMatch[1].trim()] = varMatch[2].trim();
-                    }
+            for (let t = 0; t < styleTags.length; t++) {
+                const styleEl = styleTags[t];
+                this._rootScannedTags.add(styleEl);
+                this._scanRootBlocks(styleEl, rootBlockRegex, varRegex);
+            }
+        } else {
+            // Incremental: adopt :root declarations from style tags injected
+            // after the boot snapshot (async chunks, lazy theme palettes).
+            // Document-order processing makes later declarations override
+            // earlier ones, matching the CSS cascade.
+            const styleTags = document.querySelectorAll('style:not(#litefin-dynamic-theme-vars)');
+            if (styleTags.length) {
+                const rootBlockRegex = /:root[^{]*\{([^}]+)\}/g;
+                for (let t = 0; t < styleTags.length; t++) {
+                    const styleEl = styleTags[t];
+                    if (this._rootScannedTags.has(styleEl)) continue;
+                    this._rootScannedTags.add(styleEl);
+                    this._scanRootBlocks(styleEl, rootBlockRegex, varRegex);
                 }
             }
         }

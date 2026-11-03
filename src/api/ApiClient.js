@@ -35,6 +35,191 @@ export class ServerUnreachableError extends Error {
 // API request timeout (ms)
 const REQUEST_TIMEOUT = 30000; // Increased from 10s to 30s for weaker hardware (Tizen/WebOS)
 
+// Plugin Id of the Litefin server companion plugin (fixed in its Plugin.cs, without dashes)
+const LITEFIN_COMPANION_PLUGIN_ID = 'f5c68360ca474648b47c3da5f112aa8f';
+
+/**
+ * Determine whether the host JavaScript environment provides native fetch cancellation.
+ * Modern Chromium engines (66+) support AbortSignal directly on window.fetch.
+ * Legacy TV platforms (Tizen 4.0 running Chromium 56, WebOS 4 running Chromium 53)
+ * lack signal support on fetch(); polyfilled AbortControllers dispatch events,
+ * but native fetch never cancels the network socket. This leaves stalled requests
+ * holding sockets open until the OS TCP timeout (~106s), exhausting Chromium's
+ * 6-connection pool and creating cascading navigation timeouts across the app.
+ */
+function isNativeFetchAbortSupported() {
+    try {
+        // In environments without XMLHttpRequest (e.g. Node.js unit tests), use fetch
+        if (typeof XMLHttpRequest === 'undefined') {
+            return true;
+        }
+        // Check if the Request prototype supports the signal property (Chrome 66+)
+        if (typeof Request === 'undefined' || !('signal' in Request.prototype)) {
+            return false;
+        }
+        // Verify global AbortController exists
+        if (typeof AbortController === 'undefined') {
+            return false;
+        }
+        // Verify AbortController is a native C++ constructor rather than a polyfill
+        return /\[native code\]/.test(Function.prototype.toString.call(AbortController));
+    } catch (_) {
+        return false;
+    }
+}
+
+// Cached evaluation of abort capabilities for the current runtime session
+const HAS_NATIVE_FETCH_ABORT = isNativeFetchAbortSupported();
+
+/**
+ * Execute an HTTP request via XMLHttpRequest for legacy browser runtimes.
+ * Unlike native fetch on Chromium < 66, XMLHttpRequest fully supports xhr.abort()
+ * and xhr.timeout, immediately terminating the underlying TCP socket at the
+ * browser engine level and releasing the connection slot back to the host pool.
+ *
+ * @param {string} url - Target endpoint URL
+ * @param {Object} fetchOptions - Standard fetch configuration (method, headers, body)
+ * @param {number} timeout - Request timeout threshold in milliseconds
+ * @param {AbortController} [controller] - Optional cancellation controller
+ * @returns {Promise<Object>} Response-compatible duck-typed object
+ */
+function executeXhrRequest(url, fetchOptions, timeout, controller) {
+    return new Promise((resolve, reject) => {
+        // Instantiate native XMLHttp request
+        const xhr = new XMLHttpRequest();
+        let settled = false;
+        let timeoutTimer = null;
+
+        // Clean-up and rejection helper for timeouts and manual cancellation
+        const handleAbort = () => {
+            if (settled) return;
+            settled = true;
+
+            // Clear secondary timeout timer
+            if (timeoutTimer) {
+                clearTimeout(timeoutTimer);
+                timeoutTimer = null;
+            }
+
+            // Immediately abort the hardware socket to release pool connection
+            try {
+                xhr.abort();
+            } catch (_) {}
+
+            // Build standard AbortError matching fetch timeout behavior
+            const timeoutErr = new Error(`Connection timed out after ${(timeout || REQUEST_TIMEOUT) / 1000}s`);
+            timeoutErr.name = 'AbortError';
+            reject(timeoutErr);
+        };
+
+        // Attach listener to external cancellation controller if present
+        if (controller && controller.signal) {
+            controller.signal.addEventListener('abort', handleAbort, { once: true });
+        }
+
+        // Open asynchronous HTTP connection
+        xhr.open(fetchOptions.method || 'GET', url, true);
+
+        // Populate request headers
+        if (fetchOptions.headers) {
+            for (const [key, val] of Object.entries(fetchOptions.headers)) {
+                if (val !== undefined && val !== null) {
+                    try {
+                        xhr.setRequestHeader(key, String(val));
+                    } catch (_) {}
+                }
+            }
+        }
+
+        // Configure socket timeout at native layer
+        if (timeout) {
+            try {
+                xhr.timeout = timeout;
+                xhr.ontimeout = handleAbort;
+            } catch (_) {}
+
+            // Fallback JavaScript timer in case xhr.timeout is unsupported or erratic
+            timeoutTimer = setTimeout(handleAbort, timeout);
+        }
+
+        // Handle successful HTTP response arrival
+        xhr.onload = () => {
+            if (settled) return;
+            settled = true;
+
+            // Clear timeout timer
+            if (timeoutTimer) {
+                clearTimeout(timeoutTimer);
+                timeoutTimer = null;
+            }
+
+            // Unbind abort listener
+            if (controller && controller.signal) {
+                controller.signal.removeEventListener('abort', handleAbort);
+            }
+
+            // Status 0 indicates connection abort or network rejection
+            if (xhr.status === 0) {
+                reject(new TypeError('Failed to fetch'));
+                return;
+            }
+
+            // Parse response headers into normalized case-insensitive map
+            const rawHeaders = xhr.getAllResponseHeaders() || '';
+            const headersMap = {};
+            const lines = rawHeaders.split(/\r?\n/);
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                const colonIndex = line.indexOf(':');
+                if (colonIndex > 0) {
+                    const key = line.slice(0, colonIndex).trim().toLowerCase();
+                    const val = line.slice(colonIndex + 1).trim();
+                    headersMap[key] = val;
+                }
+            }
+
+            const status = xhr.status;
+            const responseText = xhr.responseText || '';
+
+            // Return duck-typed object matching native fetch Response contract
+            const responseObj = {
+                status,
+                ok: status >= 200 && status < 300,
+                statusText: xhr.statusText || '',
+                headers: {
+                    get: (name) => headersMap[(name || '').toLowerCase()] || null
+                },
+                text: async () => responseText,
+                json: async () => JSON.parse(responseText)
+            };
+
+            resolve(responseObj);
+        };
+
+        // Handle physical network errors (DNS failures, connection refusals)
+        xhr.onerror = () => {
+            if (settled) return;
+            settled = true;
+
+            // Clear timeout timer
+            if (timeoutTimer) {
+                clearTimeout(timeoutTimer);
+                timeoutTimer = null;
+            }
+
+            // Unbind abort listener
+            if (controller && controller.signal) {
+                controller.signal.removeEventListener('abort', handleAbort);
+            }
+
+            reject(new TypeError('Failed to fetch'));
+        };
+
+        // Transmit request payload
+        xhr.send(fetchOptions.body || null);
+    });
+}
+
 // ============================================================================
 // ApiClient Class
 // ============================================================================
@@ -453,6 +638,11 @@ export class ApiClient {
             keepalive: options.keepalive
         };
 
+        // Forward cache mode if explicitly requested (e.g. 'no-cache')
+        if (options.cache) {
+            fetchOptions.cache = options.cache;
+        }
+
         // Add body for POST/PUT requests
         if (options.body !== undefined && options.body !== null) {
             if (options.body instanceof FormData) {
@@ -476,7 +666,7 @@ export class ApiClient {
             // environments where the Fetch specification disallowed signals on keepalive.
             const timeout = options.timeout || (options.keepalive ? 0 : REQUEST_TIMEOUT);
             const controller = new AbortController();
-            const timeoutId = timeout ? setTimeout(() => controller.abort(), timeout) : null;
+            let timeoutId = null;
             if (timeout) {
                 fetchOptions.signal = controller.signal;
             }
@@ -484,29 +674,55 @@ export class ApiClient {
             log.debug(`Fetching ${url} (timeout: ${timeout || 'none'}ms)...`);
             let response;
             try {
-                response = await fetch(url, fetchOptions);
-            } catch (fetchErr) {
-                /*
-                 * On Smart TVs and legacy web runtimes (such as Tizen 5.5 running Chromium 69),
-                 * cross-origin fetch calls with keepalive:true and non-simple headers (like Authorization
-                 * or Content-Type: application/json) trigger an immediate 'TypeError: Failed to fetch'
-                 * due to lack of CORS preflight support for keepalive in older browser engines.
-                 * If keepalive was active and threw a TypeError, fall back to a standard fetch without keepalive.
-                 */
-                if (fetchOptions.keepalive && fetchErr instanceof TypeError) {
-                    log.warn(`Fetch with keepalive failed (${fetchErr.message}); retrying without keepalive...`);
-                    delete fetchOptions.keepalive;
-                    if (!fetchOptions.signal && REQUEST_TIMEOUT) {
-                        const fallbackController = new AbortController();
-                        setTimeout(() => fallbackController.abort(), REQUEST_TIMEOUT);
-                        fetchOptions.signal = fallbackController.signal;
+                if (HAS_NATIVE_FETCH_ABORT) {
+                    // Modern browser engine (Chrome 66+) with native fetch AbortSignal support
+                    const executeFetch = async () => {
+                        try {
+                            return await fetch(url, fetchOptions);
+                        } catch (fetchErr) {
+                            /*
+                             * On Smart TVs and legacy web runtimes (such as Tizen 5.5 running Chromium 69),
+                             * cross-origin fetch calls with keepalive:true and non-simple headers (like Authorization
+                             * or Content-Type: application/json) trigger an immediate 'TypeError: Failed to fetch'
+                             * due to lack of CORS preflight support for keepalive in older browser engines.
+                             * If keepalive was active and threw a TypeError, fall back to a standard fetch without keepalive.
+                             */
+                            if (fetchOptions.keepalive && fetchErr instanceof TypeError) {
+                                log.warn(`Fetch with keepalive failed (${fetchErr.message}); retrying without keepalive...`);
+                                delete fetchOptions.keepalive;
+                                return await fetch(url, fetchOptions);
+                            }
+                            throw fetchErr;
+                        }
+                    };
+
+                    // On modern platforms, wrap fetch in Promise.race with an explicit timeout promise
+                    if (timeout) {
+                        const timeoutPromise = new Promise((_, reject) => {
+                            timeoutId = setTimeout(() => {
+                                try {
+                                    controller.abort();
+                                } catch (_) {}
+                                const timeoutErr = new Error(`Connection timed out after ${timeout / 1000}s`);
+                                timeoutErr.name = 'AbortError';
+                                reject(timeoutErr);
+                            }, timeout);
+                        });
+                        response = await Promise.race([executeFetch(), timeoutPromise]);
+                    } else {
+                        response = await executeFetch();
                     }
-                    response = await fetch(url, fetchOptions);
                 } else {
-                    throw fetchErr;
+                    // Legacy smart TV platform (Tizen 4.0 / WebOS 4) — execute via XMLHttpRequest
+                    // so xhr.abort() physically closes the underlying socket and frees Chromium's connection pool
+                    response = await executeXhrRequest(url, fetchOptions, timeout, controller);
+                }
+            } finally {
+                if (timeoutId) {
+                    clearTimeout(timeoutId);
+                    timeoutId = null;
                 }
             }
-            if (timeoutId) clearTimeout(timeoutId);
 
             // Handle 304 Not Modified — return cached response body
             if (response.status === 304 && etagEntry) {
@@ -586,6 +802,19 @@ export class ApiClient {
             // Handle Network Errors (DNS, Connection Refused, Offline) or Timeout
             const isTimeout = error.name === 'AbortError';
             const isNetworkError = error instanceof TypeError;
+
+            // =========================================================================
+            // IDEMPOTENT GET STALE SOCKET AUTO-RECOVERY
+            // =========================================================================
+            // If an idempotent GET request timed out or failed on a stale socket (e.g.
+            // after long video playback or router conntrack idle timeouts), perform a
+            // single immediate retry on a fresh connection. Aborting the previous request
+            // closed the dead socket, allowing the retry to succeed instantly.
+            // =========================================================================
+            if ((isTimeout || isNetworkError) && !isRetry && method === 'GET' && !options._isWolTimeoutRetry) {
+                log.info(`GET ${endpoint} timed out or stalled on socket; retrying on fresh connection...`);
+                return this.request(endpoint, options, true);
+            }
 
             if (isTimeout || isNetworkError) {
                 const timeout = options.timeout || REQUEST_TIMEOUT;
@@ -1260,9 +1489,9 @@ export class ApiClient {
                         const adminList = await serverPluginClient.getInstalledPlugins();
                         if (Array.isArray(adminList)) {
                             const match = adminList.some((p) => {
-                                const name = (p.Name || p.name || '').toLowerCase();
-                                const id = (p.Id || p.id || '').toLowerCase();
-                                const matchesName = name.includes('litefin') || id.includes('litefin');
+                                // Match by GUID: the "Litefin Client" web plugin also has "litefin" in its name
+                                const id = (p.Id || p.id || '').replace(/-/g, '').toLowerCase();
+                                const matchesId = id === LITEFIN_COMPANION_PLUGIN_ID;
                                 const status = (p.Status || p.status || '').toString().toLowerCase();
                                 const isExplicitlyDisabled =
                                     status === 'disabled' ||
@@ -1272,7 +1501,7 @@ export class ApiClient {
                                     status === 'superseded';
                                 const isActive =
                                     !isExplicitlyDisabled && (!status || status === 'active' || status === 'restart');
-                                return matchesName && isActive;
+                                return matchesId && isActive;
                             });
                             this._hasLitefinServerPlugin = match;
                             log.info(
@@ -1288,9 +1517,13 @@ export class ApiClient {
                 // Strategy B: Lightweight silent probe to /Litefin/Hero
                 log.debug('Probing Litefin server companion plugin presence...');
                 const probeResult = await this.get('/Litefin/Hero', { limit: 1 }, { silent: true, warnOnError: true });
-                this._hasLitefinServerPlugin = !!probeResult;
-                log.info('Litefin server companion plugin is installed and accessible');
-                return true;
+                // The Litefin Client web plugin answers unknown /Litefin/* paths with index.html
+                const isAvailable = Array.isArray(probeResult?.Items);
+                this._hasLitefinServerPlugin = isAvailable;
+                log.info(
+                    `Litefin server companion plugin ${isAvailable ? 'is installed and accessible' : 'not found'}`
+                );
+                return isAvailable;
             } catch (err) {
                 // 404 indicates the plugin is not installed or disabled on this server
                 if (err.status === 404 || err.message?.includes('Not found') || err.message?.includes('404')) {
@@ -1336,7 +1569,7 @@ export class ApiClient {
                     parentIds: parentIds.join(','),
                     ...params
                 },
-                { warnOnError: true }
+                { warnOnError: true, timeout: 6000 }
             );
         } catch (e) {
             return null;
@@ -1361,7 +1594,7 @@ export class ApiClient {
                 {
                     parentIds: parentIds.join(',')
                 },
-                { warnOnError: true }
+                { warnOnError: true, timeout: 6000 }
             );
         } catch (e) {
             return null;
@@ -2451,11 +2684,13 @@ export class ApiClient {
      */
     async uploadClientLog(name, data) {
         // Send raw text body, filename in query string
+        // Provide extended 60-second timeout budget to accommodate large telemetry bundles over TV WiFi
         const url = `/ClientLog/Document?name=${encodeURIComponent(name)}`;
         return this.post(url, data, {
             headers: {
                 'Content-Type': 'text/plain'
-            }
+            },
+            timeout: 60000
         });
     }
 

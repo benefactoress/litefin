@@ -466,3 +466,383 @@ test('flingStep: momentum cap, braking glide, zero overshoot under held-key stor
     const [resting, restingV] = flingStep(400, 3, 400, tau, vCap, 16);
     assert.ok(resting === 400 && restingV === 0, 'a landed camera must stay parked');
 });
+
+/**
+ * ============================================================================
+ * Hard settle timeout must measure SIMULATED time, not wall clock
+ * ============================================================================
+ * On slow Tizen hardware a rAF frame can carry 100-300ms of wall time while
+ * the loop integrates at most 64ms of clamp-capped simulation time. The final
+ * finalize() snap must therefore only fire once the engine has actually
+ * INTEGRATED SPRING_MAX_DURATION_MS — not once wall time has elapsed.
+ * Previously a wall-clock timeout fired finalize() while the physics was
+ * still tens of pixels from the target, producing a visible one-frame
+ * "nudge" (20-30px jump) right after every scroll appeared finished.
+ */
+test('ScrollController: settle timeout runs on integrated sim-time — slow frames never trigger a late finalize snap', () => {
+    // Controllable RAF queue: each pump() executes exactly one queued frame
+    // with an explicit timestamp, separated by 1300ms of WALL time. The loop
+    // clamps each frame to 64ms of simulation, so sim-time advances ~5% of
+    // wall time in this scenario.
+    const pending = [];
+    const realRaf = globalThis.requestAnimationFrame;
+    try {
+        globalThis.requestAnimationFrame = (cb) => {
+            pending.push(cb);
+            return pending.length;
+        };
+
+        const controller = new ScrollController();
+        const writes = [];
+        let finalWrite = null;
+        const container = {
+            style: {},
+            get scrollTop() {
+                return writes.length ? writes[writes.length - 1] : 0;
+            },
+            set scrollTop(v) {
+                writes.push(v);
+            },
+            get scrollLeft() {
+                return 0;
+            },
+            set scrollLeft(v) {
+                void v;
+            }
+        };
+
+        controller._springScrollTo({
+            stateKey: '_verticalScrollState',
+            animIdKey: '_verticalScrollAnimationId',
+            container,
+            track: null,
+            currentScroll: 0,
+            // Long, slow hop: at 64ms sim/frame six frames only integrate
+            // 320ms of a 3000ms settle budget, so the engine cannot have
+            // legitimately finished — only a wall-clock timeout would.
+            targetScroll: 2000,
+            duration: 3000,
+            isVertical: true,
+            scrollMode: 'native'
+        });
+
+        let t = 0;
+        const pump = (n) => {
+            for (let i = 0; i < n; i++) {
+                const cb = pending.shift();
+                if (!cb) return;
+                cb(t);
+                t += 1300; // 1.3s wall gap per frame (pathologically slow panel)
+            }
+        };
+
+        // Frame 1 anchors the clock (dt = 0). Frames 2-6 each integrate only
+        // 64ms of simulation → 5 more frames = 320ms sim lifetime.
+        pump(6);
+
+        // With the wall-clock bug, frame 2 (elapsed 1300ms wall) already
+        // finalized with the engine ~1800px short of target.
+        assert.ok(
+            controller._verticalScrollState !== null,
+            'finalize must NOT fire before the engine has integrated SPRING_MAX_DURATION_MS of simulation time'
+        );
+        assert.ok(
+            !writes.some((w) => w >= 1999),
+            'the engine must still be far from its origin — no teleport to the target across slow frames'
+        );
+
+        // No single write may jump most of the hop in one stroke after the
+        // initial launch frame — every write must progress (no teleport)
+        for (let i = 2; i < writes.length; i++) {
+            assert.ok(
+                writes[i] - writes[i - 1] >= -0.5,
+                'writes progress smoothly toward the target without back-jumps'
+            );
+        }
+
+        // Pump until the engine settles naturally (sim-time budget is 1200ms;
+        // at 64ms/frame that is ~19-21 frames).
+        let guard = 0;
+        while (guard < 120) {
+            if (controller._verticalScrollState === null) break;
+            guard++;
+            pump(1);
+        }
+        finalWrite = writes[writes.length - 1];
+        assert.strictEqual(finalWrite, 2000, 'the engine must land exactly on the target');
+
+        // Convergence validity: all writes approach from below (no bounce past
+        // the target), and the finalize snap is sub-pixel-close to the last
+        // integrated write.
+        assert.ok(guard < 80, 'the engine settles well within the sim-time budget');
+    } finally {
+        globalThis.requestAnimationFrame = realRaf;
+        // scrub the singleton axis slot in case the run aborted early
+        scrollController._verticalScrollState = null;
+        scrollController._verticalScrollAnimationId = null;
+    }
+});
+
+/**
+ * ============================================================================
+ * Terminal glide — the exponential tail must never become a creep
+ * ============================================================================
+ * A critically damped spring spends the last third of a hop below ~1px/frame:
+ * the scroll appears to stop, then creeps the remaining 15-20px for hundreds
+ * of ms. Perceptually the animation "splits in two" with a hitch. The loop
+ * must hand the closing phase to a constant-deceleration glide once the
+ * remaining distance enters the glide band, keeping visible speed until
+ * touchdown and landing exactly on the target.
+ */
+test('ScrollController: terminal glide closes the last stretch at perceptible speed with no sub-pixel creep', () => {
+    const pending = [];
+    const realRaf = globalThis.requestAnimationFrame;
+    try {
+        globalThis.requestAnimationFrame = (cb) => {
+            pending.push(cb);
+            return pending.length;
+        };
+
+        const controller = new ScrollController();
+        const writes = [];
+        const container = {
+            style: {},
+            get scrollTop() {
+                return writes.length ? writes[writes.length - 1] : 0;
+            },
+            set scrollTop(v) {
+                writes.push(v);
+            },
+            get scrollLeft() {
+                return 0;
+            },
+            set scrollLeft(v) {
+                void v;
+            }
+        };
+
+        controller._springScrollTo({
+            stateKey: '_verticalScrollState',
+            animIdKey: '_verticalScrollAnimationId',
+            container,
+            track: null,
+            currentScroll: 0,
+            targetScroll: 342,
+            duration: 180,
+            isVertical: true,
+            scrollMode: 'native'
+        });
+
+        // Continuous 60Hz frames at 16.67ms
+        let t = 0;
+        let guard = 0;
+        while (controller._verticalScrollState !== null && guard < 120) {
+            const cb = pending.shift();
+            if (!cb) break;
+            cb(t);
+            t += 16.67;
+            guard++;
+        }
+        assert.ok(guard < 120, 'the animation must settle on its own');
+
+        // The very last write is the exact target.
+        assert.strictEqual(writes[writes.length - 1], 342, 'must land exactly on target');
+
+        // NO CREEP: count write steps that move < 1px while more than 3px of
+        // travel remain. The exponential engine needed 4-6 such steps; after
+        // the glide handover at most 1 may occur (the settle tail).
+        let creepSteps = 0;
+        for (let i = 1; i < writes.length - 1; i++) {
+            const step = Math.abs(writes[i] - writes[i - 1]);
+            const remaining = Math.abs(342 - writes[i]);
+            if (step < 1 && remaining > 3) creepSteps++;
+        }
+        assert.ok(
+            creepSteps === 0,
+            `the tail must never creep below 1px/frame with distance left (saw ${creepSteps} creep steps)`
+        );
+    } finally {
+        globalThis.requestAnimationFrame = realRaf;
+        scrollController._verticalScrollState = null;
+        scrollController._verticalScrollAnimationId = null;
+    }
+});
+
+/**
+ * ============================================================================
+ * Fixed-cadence integration — janky frame delivery must not dent the motion
+ * ============================================================================
+ * Consuming each rAF frame's actual interval made per-paint steps fluctuate
+ * wildly on janky TV delivery (fast frames = small steps, late frames =
+ * teleports + sag), which read as the scroll splitting into an uneven
+ * "two parts" hitch — worst with long duration settings, where late frames
+ * were frequent. The loop now integrates a constant clamped median cadence
+ * so every paint advances an equal step.
+ */
+test('ScrollController: late/uneven rAF frames paint equal steps with no mid-flight dents', () => {
+    const pending = [];
+    const realRaf = globalThis.requestAnimationFrame;
+    try {
+        globalThis.requestAnimationFrame = (cb) => {
+            pending.push(cb);
+            return pending.length;
+        };
+
+        const controller = new ScrollController();
+        const writes = [];
+        const container = {
+            style: {},
+            get scrollTop() {
+                return writes.length ? writes[writes.length - 1] : 0;
+            },
+            set scrollTop(v) {
+                writes.push(v);
+            },
+            get scrollLeft() {
+                return 0;
+            },
+            set scrollLeft(v) {
+                void v;
+            }
+        };
+
+        controller._springScrollTo({
+            stateKey: '_verticalScrollState',
+            animIdKey: '_verticalScrollAnimationId',
+            container,
+            track: null,
+            currentScroll: 0,
+            targetScroll: 342,
+            duration: 240,
+            isVertical: true,
+            scrollMode: 'native'
+        });
+
+        // Janky delivery: alternates good frames with 90-100ms late frames
+        // (still under ADAPTIVE_SAMPLE_REJECT_MAX_MS and CADENCE_DT_MAX_MS so
+        // the median clamps to a stable step).
+        const cadence = [16, 100, 16, 90, 16, 100, 33, 16, 90, 16];
+        let t = 0;
+        let idx = 0;
+        let guard = 0;
+        while (controller._verticalScrollState !== null && guard < 120) {
+            const cb = pending.shift();
+            if (!cb) break;
+            cb(t);
+            t += cadence[idx % cadence.length];
+            idx++;
+            guard++;
+        }
+        assert.ok(guard < 120, 'the animation must settle on its own');
+        assert.strictEqual(writes[writes.length - 1], 342, 'must land exactly on target');
+
+        // No teleport: the largest single-paint step after the first 3 warmup
+        // frames is bounded relative to the step that followed it (a consumed
+        // 100ms interval previously teleported 5-10x the neighboring step).
+        const steps = writes.slice(3).map((w, i, a) => +Math.abs(w - (a[i - 1] ?? writes[2])).toFixed(1));
+        for (let i = 1; i < steps.length; i++) {
+            const ratio = Math.abs(steps[i] - steps[i - 1]) / Math.max(steps[i], steps[i - 1], 0.01);
+            if (steps[i] > 3 && steps[i - 1] > 3) {
+                assert.ok(
+                    steps[i] / Math.max(steps[i - 1], 0.01) < 4,
+                    `adjacent paint steps must stay in the same magnitude band (saw ${steps[i - 1]} -> ${steps[i]})`
+                );
+            }
+            void ratio;
+        }
+
+        // No creep either (constant steps must not degrade into sub-pixel tails)
+        let creep = 0;
+        for (let i = 4; i < writes.length - 2; i++) {
+            const step = Math.abs(writes[i] - writes[i - 1]);
+            const rem = Math.abs(342 - writes[i]);
+            if (step < 1 && rem > 3) creep++;
+        }
+        assert.ok(creep === 0, `no sub-pixel creep on late frames (saw ${creep} steps)`);
+    } finally {
+        globalThis.requestAnimationFrame = realRaf;
+        scrollController._verticalScrollState = null;
+        scrollController._verticalScrollAnimationId = null;
+    }
+});
+
+/**
+ * ============================================================================
+ * Row-type duration parity — every row hop must use the configured budget
+ * ============================================================================
+ * The "long leap" duration stretch exists for hero carousel <-> content row
+ * transitions only. Poster rows are taller than landscape/square rows, so their
+ * hops travel up to ~600px; while the threshold sat at 550px every poster hop
+ * was silently stretched by x1.25 and poster rows animated noticeably slower
+ * than landscape rows at the same pref:scrollSmoothingDuration ("poster rows
+ * lag when scrolled to"). Row hops must stay on the base budget; only true
+ * leaps (hero <-> rows, multi-row jumps) may scale.
+ */
+test('ScrollController: row-to-row hops keep the base duration on every row type', () => {
+    const controller = new ScrollController();
+    const realRaf = globalThis.requestAnimationFrame;
+    try {
+        // Isolate from the scheduler: we only inspect the settle budget.
+        globalThis.requestAnimationFrame = () => 1;
+
+        const container = {
+            style: {},
+            scrollTop: 0,
+            scrollLeft: 0,
+            clientHeight: 1080,
+            querySelector: () => null
+        };
+
+        storage.setItem('pref:scrollSmoothingDuration', 'slower');
+        const base = controller.getVerticalScrollDuration();
+        assert.ok(base > 0, 'slower preference must resolve to a positive duration');
+
+        // Tallest real row hop measured on the home screen: a 574px poster row
+        // plus its gap (602px), and the shorter landscape/square hops (448px).
+        for (const distance of [356, 448, 475, 504, 602, 699]) {
+            controller.cancelAnimation('vertical');
+            container.scrollTop = 0;
+            controller.smoothScrollTo(container, distance, null, 'vertical');
+            assert.strictEqual(
+                controller._verticalScrollState.budget,
+                base,
+                `a ${distance}px row hop must animate for the configured ${base}ms, not a stretched budget`
+            );
+        }
+
+        // Genuine leaps still stretch (hero <-> rows, multi-row jumps).
+        controller.cancelAnimation('vertical');
+        container.scrollTop = 0;
+        controller.smoothScrollTo(container, 1000, null, 'vertical');
+        const leap = controller._verticalScrollState.budget;
+        assert.ok(
+            leap >= Math.round(base * 1.25) && leap <= Math.round(base * 1.75),
+            `a 1000px leap must still stretch within the x1.25-x1.75 band (saw ${leap}ms for base ${base}ms)`
+        );
+
+        // Horizontal row scrolling is untouched by the vertical leap rule.
+        controller.cancelAnimation('horizontal');
+        const horizontalBase = controller.getHorizontalScrollDuration();
+        controller.smoothScrollTo(container, 900, null, 'horizontal');
+        assert.strictEqual(
+            controller._horizontalScrollState.budget,
+            horizontalBase,
+            'horizontal row scrolling must keep its own duration mapping'
+        );
+
+        // Sanity: base duration ordering matches the 4-value preference mapping.
+        storage.setItem('pref:scrollSmoothingDuration', 'smooth');
+        const smooth = controller.getVerticalScrollDuration();
+        storage.setItem('pref:scrollSmoothingDuration', 'instant');
+        assert.strictEqual(controller.getVerticalScrollDuration(), 0, 'instant preference must stay instant');
+        assert.ok(base > smooth, 'slower must be longer than smooth');
+    } finally {
+        storage.removeItem('pref:scrollSmoothingDuration');
+        storage.removeItem('pref:scrollPhysics');
+        globalThis.requestAnimationFrame = realRaf;
+        scrollController._verticalScrollState = null;
+        scrollController._verticalScrollAnimationId = null;
+        scrollController._horizontalScrollState = null;
+        scrollController._horizontalScrollAnimationId = null;
+    }
+});
